@@ -11,7 +11,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from memseek.search.names import lexical_overlap, name_forms, name_identity, name_match, name_score
+from memseek.search.names import (
+    lexical_overlap,
+    name_forms,
+    name_identity,
+    name_match,
+    name_score,
+    query_token_hits,
+)
 
 # Cosine similarity on text-embedding-3-small. Below this, a vector neighbor
 # is not evidence the row is about the task. Keyword and name hits do not
@@ -398,10 +405,20 @@ def _people_decisions(
         if _owner_reviewed(content):
             reviewed_keys.update(name_identity(content))
     kinds = [name_match(query, row.get("content") or {}) for row in visible]
+    token_hits = [query_token_hits(query, row.get("content") or {}) for row in visible]
+    # An exact token wins. Prefix and fuzzy hits for that token are dropped,
+    # so Barba does not also return Bárbara or Barra. A single-token fuzzy
+    # hit is kept only when nobody matched the token exactly.
+    exact_tokens = {
+        index
+        for hits in token_hits
+        for index, hit in enumerate(hits)
+        if hit == "exact"
+    }
     use_fallback = not any(kind in {"exact", "all"} for kind in kinds)
     mean, _stdev = _corpus_similarity(visible)
     decisions: list[tuple[Mapping[str, Any], bool, float, str]] = []
-    for row, _kind in zip(visible, kinds, strict=True):
+    for row, _kind, hits in zip(visible, kinds, token_hits, strict=True):
         keep, score, reason = _people_reason(
             row,
             query,
@@ -409,6 +426,11 @@ def _people_decisions(
             others=_next_similarity(visible, str(row.get("id"))),
             use_fallback=use_fallback,
         )
+        if keep and reason in {"exact", "all", "fallback"} and any(
+            index in exact_tokens and hit in {"prefix", "fuzzy"} for index, hit in enumerate(hits)
+        ):
+            keep = False
+            reason = "rejected-inexact"
         content = row.get("content") or {}
         if keep and _hides_as_duplicate(content, reviewed_keys):
             keep = False

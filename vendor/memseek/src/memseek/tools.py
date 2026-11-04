@@ -13,7 +13,6 @@ from typing import Any
 
 from memseek.config import Settings
 from memseek.definitions import DefinitionCatalog, PackageDefinition, ViewDefinition
-from memseek.definitions.models import parameters_json_schema
 from memseek.search.pagination import paginates, view_input_schema
 
 _JSON_SCHEMA_DRAFT = "https://json-schema.org/draft/2020-12/schema"
@@ -158,9 +157,15 @@ def _invocation_input_schema(kind: str) -> dict[str, Any]:
 
 
 def _parameters_input_schema(parameters: Any) -> dict[str, Any]:
-    """Add the schema dialect marker to a shared parameter object schema."""
+    """Add the schema dialect marker and the continuation offsets.
 
-    return {"$schema": _JSON_SCHEMA_DRAFT, **parameters_json_schema(parameters)}
+    ``offset`` and each block ``*_offset`` are accepted even when the stored
+    artifact was published before those names were declared.
+    """
+
+    from memseek.artifacts import artifact_parameter_schema
+
+    return {"$schema": _JSON_SCHEMA_DRAFT, **artifact_parameter_schema(parameters)}
 
 
 def _object_output_schema(description: str) -> dict[str, Any]:

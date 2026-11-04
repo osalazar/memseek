@@ -263,6 +263,21 @@ class PeopleNames(unittest.TestCase):
         )
         self.assertEqual(page.ids[0], "named")
 
+    def test_exact_surname_drops_prefix_and_fuzzy(self):
+        rows = [
+            person("elizabeth", "Name: Dra. Elizabeth Barba Orozco\nAliases: Dra. Barba"),
+            person("barbara", "Name: Bárbara Chaves"),
+            person("barra", "Name: Carlos de la Barra"),
+        ]
+        page = select_people(
+            rows, query="Barba", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(page.ids, ("elizabeth",))
+        only_fuzzy = select_people(
+            rows[1:], query="Barba", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(only_fuzzy.ids[0], "barbara")
+
     def test_nonsense_ignores_negative_aliases_notes_and_loose_fuzzy(self):
         def record(identity, name, aliases="", notes="", **kwargs):
             lines = [f"Name: {name}"]
@@ -502,7 +517,10 @@ class PeopleLoader(unittest.TestCase):
         self.assertIn("not owner-reviewed", people[0]["text"])
         self.assertIn("Alcívar", people[1]["text"])
         self.assertIn("Name: Elizabeth Barba Orozco", people[0]["text"])
-        self.assertIn("Dra. Barba", people[0]["text"])
+        self.assertIn("Print: Dra. Barba", people[0]["text"])
+        self.assertNotIn("Aliases:", people[0]["text"])
+        self.assertIn("reach unknown", people[1]["text"])
+        self.assertNotIn("HOLE", people[1]["text"])
 
     def test_reparse_is_idempotent(self):
         first, _ = load_people.parse_people(self.SAMPLE)
@@ -591,6 +609,63 @@ class PeopleLoader(unittest.TestCase):
             },
         ]
         self.assertEqual(check_people_duplicates.count_duplicate_candidates(rows), {"duplicates": 1})
+
+    def test_columns_aliases_and_remap_plan(self):
+        text = "\n".join(
+            [
+                "# comment",
+                "## also a comment",
+                "OPS: one-line FILE name|x|y|P1|ES|note",
+                "House: kitchen|a|b",
+                "Maria Leticia Guelfi (Leticia)|hole|friend|—|ES|4w2 polite warm",
+                "Luis Prado|aka Neto|colleague|P3|EN|3w5 type only|extra print",
+                "Ana|reach HOLE|neighbor|P1|ES",
+            ]
+        )
+        people, notes = load_people.parse_people(text)
+        self.assertEqual([person["name"] for person in people], [
+            "Maria Leticia Guelfi (Leticia)",
+            "Luis Prado",
+            "Ana",
+        ])
+        self.assertTrue(any(note.endswith(": skipped") for note in notes))
+        maria, luis, ana = people
+        self.assertEqual(
+            next(line for line in maria["text"].splitlines() if line.startswith("Aliases:")),
+            "Aliases: Leticia",
+        )
+        self.assertIn("Print: 4w2 polite warm", maria["text"])
+        self.assertIn("reach unknown", maria["text"])
+        self.assertNotIn("HOLE", maria["text"])
+        self.assertIn("Priority: —", maria["text"])
+        self.assertIn("Language: ES", maria["text"])
+        self.assertIn("Aliases: Neto", luis["text"])
+        self.assertIn("Print: 3w5 type only | extra print", luis["text"])
+        self.assertIn("reach unknown", ana["text"])
+        stored = [
+            {
+                "key": "archivist-maria",
+                "content": {
+                    "source": "archivist-file",
+                    "text": "Name: Maria Leticia Guelfi (Leticia)\nReach: HOLE\nPrint: old",
+                },
+            },
+            {
+                "key": "archivist-junk",
+                "content": {"source": "archivist-file", "text": "Name: OPS: one-line FILE name\nRole: header"},
+            },
+            {
+                "key": "reviewed-person",
+                "content": {"text": "Name: Someone Reviewed. Owner reviewed.", "activation": "confirmed"},
+            },
+        ]
+        plan = load_people.plan_remap(people, stored)
+        self.assertEqual(plan["updated"], 1)
+        self.assertEqual(plan["unchanged"], 0)
+        self.assertEqual(plan["missing"], 2)
+        self.assertEqual(plan["not_found"], 1)
+        self.assertEqual(plan["not_found_names"], ["ops: one-line file name"])
+        self.assertEqual(plan["changes"][0][1]["key"], "archivist-maria")
 
         class _Tty:
             def isatty(self):

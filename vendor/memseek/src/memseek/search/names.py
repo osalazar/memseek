@@ -196,15 +196,44 @@ def _fuzzy_token(query: str, candidate: str) -> bool:
     return levenshtein(query, candidate) <= 1
 
 
+_HIT_RANK = {"exact": 3, "prefix": 2, "fuzzy": 1}
+
+
+def _token_hit(query: str, candidate: str) -> str | None:
+    """``exact``, ``prefix``, ``fuzzy``, or nothing."""
+
+    if query == candidate:
+        return "exact"
+    shorter, longer = (query, candidate) if len(query) <= len(candidate) else (candidate, query)
+    if len(shorter) >= 3 and longer.startswith(shorter):
+        return "prefix"
+    if _fuzzy_token(query, candidate):
+        return "fuzzy"
+    return None
+
+
 def _token_match(query: str, candidate: str) -> bool:
     """Exact, a prefix of 3 or more characters, or a tight fuzzy match."""
 
-    if query == candidate:
-        return True
-    shorter, longer = (query, candidate) if len(query) <= len(candidate) else (candidate, query)
-    if len(shorter) >= 3 and longer.startswith(shorter):
-        return True
-    return _fuzzy_token(query, candidate)
+    return _token_hit(query, candidate) is not None
+
+
+def query_token_hits(query: str, content: Mapping[str, object]) -> list[str | None]:
+    """Best hit for each significant query token: exact, prefix, or fuzzy."""
+
+    query_tokens = _name_tokens(query)
+    name_tokens: list[str] = []
+    for form in name_forms(content):
+        name_tokens.extend(_name_tokens(form))
+    hits: list[str | None] = []
+    for token in query_tokens:
+        best: str | None = None
+        for candidate in name_tokens:
+            hit = _token_hit(token, candidate)
+            if hit is not None and (best is None or _HIT_RANK[hit] > _HIT_RANK[best]):
+                best = hit
+        hits.append(best)
+    return hits
 
 
 def _negative_alias(phrase: str) -> bool:

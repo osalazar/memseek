@@ -31,7 +31,7 @@ from memseek import __version__
 from memseek.canonical_records import CanonicalRecordWrite, insert_canonical_record_tx
 from memseek.config import Settings
 from memseek.db import DatabaseConnection, DatabasePool
-from memseek.definitions import ArtifactDefinition, DefinitionCatalog, parameters_json_schema
+from memseek.definitions import ArtifactDefinition, DefinitionCatalog
 from memseek.definitions.base import split_exact_reference
 from memseek.definitions.models import parameter_value_matches
 from memseek.locks import acquire_entity_locks, acquire_workspace_lock
@@ -154,7 +154,7 @@ def artifact_catalog_payload(catalog: DefinitionCatalog) -> dict[str, Any]:
                 },
                 "input_schema": {
                     "$schema": "https://json-schema.org/draft/2020-12/schema",
-                    **parameters_json_schema(artifact.parameters),
+                    **artifact_parameter_schema(artifact.parameters),
                 },
                 "blocks": sorted(artifact.blocks),
                 "snapshot": (
@@ -173,12 +173,58 @@ def artifact_catalog_payload(catalog: DefinitionCatalog) -> dict[str, Any]:
     return {"artifacts": artifacts}
 
 
+def _paging_parameter(name: str) -> Any:
+    from memseek.definitions.models import ParameterDefinition
+
+    if name == "offset":
+        description = (
+            "Continue every block from this next_offset unless that block's own "
+            "*_offset was set."
+        )
+    else:
+        block = name.removesuffix("_offset")
+        description = f"Continue the {block} block from blocks.{block}.next_offset."
+    return ParameterDefinition(
+        type="integer",
+        required=False,
+        default=0,
+        minimum=0,
+        description=description,
+    )
+
+
+def paging_parameters() -> dict[str, Any]:
+    """offset plus the block continuation names, even on a catalog published earlier."""
+
+    names = ("offset", *_BLOCK_OFFSET_PARAMETERS.values())
+    return {name: _paging_parameter(name) for name in names}
+
+
+def artifact_parameter_schema(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """Catalog parameters plus the continuation offsets callers page with."""
+
+    from memseek.definitions.models import parameter_json_schema, parameters_json_schema
+
+    schema = parameters_json_schema(parameters)
+    properties = schema.setdefault("properties", {})
+    for name, parameter in paging_parameters().items():
+        properties.setdefault(name, parameter_json_schema(parameter))
+    return schema
+
+
 def resolve_artifact_parameters(
     artifact: ArtifactDefinition, supplied: dict[str, Any]
 ) -> dict[str, Any]:
-    """Validate supplied values against the artifact's typed parameter schema."""
+    """Validate supplied values against the artifact's typed parameter schema.
 
-    unknown = sorted(set(supplied) - set(artifact.parameters))
+    ``offset`` and the ``*_offset`` block names are always accepted. A bare
+    ``offset`` fills any block offset the caller did not set, so page 2 of a
+    block that returned ``next_offset`` is one argument.
+    """
+
+    extras = paging_parameters()
+    allowed = {**extras, **artifact.parameters}
+    unknown = sorted(set(supplied) - set(allowed))
     if unknown:
         raise ArtifactRequestError(
             "artifact_parameter", f"unknown artifact parameter(s): {', '.join(unknown)}"
@@ -201,6 +247,21 @@ def resolve_artifact_parameters(
                 f"artifact parameter {name!r} does not match its declared schema",
             )
         resolved[name] = value
+    for name, parameter in extras.items():
+        if name in artifact.parameters or name not in supplied:
+            continue
+        value = supplied[name]
+        if not parameter_value_matches(parameter, value):
+            raise ArtifactRequestError(
+                "artifact_parameter",
+                f"artifact parameter {name!r} does not match its declared schema",
+            )
+        resolved[name] = value
+    if "offset" in supplied:
+        bare = resolved.get("offset", supplied["offset"])
+        for name in _BLOCK_OFFSET_PARAMETERS.values():
+            if name not in supplied:
+                resolved[name] = bare
     return resolved
 
 

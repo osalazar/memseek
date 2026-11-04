@@ -31,6 +31,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -53,7 +54,10 @@ def skipped(line: str) -> bool:
     text = line.strip()
     if not text:
         return True
-    if text.startswith("#") or text.startswith("LOCK") or text.startswith("KEEP"):
+    folded = text.casefold()
+    if folded.startswith("#") or folded.startswith("lock") or folded.startswith("keep"):
+        return True
+    if folded.startswith("ops:") or folded.startswith("house:"):
         return True
     return False
 
@@ -63,25 +67,35 @@ def is_header(line: str) -> bool:
     return first == "name"
 
 
-def _aliases(name: str, extra: list[str]) -> list[str]:
+def _parentheticals(value: str) -> list[str]:
     found: list[str] = []
     start = 0
     while True:
-        open_at = name.find("(", start)
+        open_at = value.find("(", start)
         if open_at < 0:
             break
-        close_at = name.find(")", open_at + 1)
+        close_at = value.find(")", open_at + 1)
         if close_at < 0:
             break
-        inner = name[open_at + 1 : close_at].strip()
+        inner = value[open_at + 1 : close_at].strip()
         if inner:
             found.append(inner)
         start = close_at + 1
-    for part in extra:
-        if "@" in part or part.isdigit():
-            continue
-        if any(ch.isalpha() for ch in part):
-            found.append(part)
+    return found
+
+
+def _aliases(name: str, reach: str) -> list[str]:
+    """Nicknames in the name, or an explicit alias written in the reach field.
+
+    PRINT and the other trailing columns are not aliases.
+    """
+
+    found = _parentheticals(name)
+    found.extend(_parentheticals(reach))
+    for match in re.finditer(r"(?i)\b(?:aka|alias)\s*:?\s*([^,;|]+)", reach):
+        alias = match.group(1).strip()
+        if alias:
+            found.append(alias)
     seen: set[str] = set()
     unique: list[str] = []
     for alias in found:
@@ -90,6 +104,15 @@ def _aliases(name: str, extra: list[str]) -> list[str]:
             seen.add(key)
             unique.append(alias)
     return unique
+
+
+def reach_text(reach: str) -> str:
+    """HOLE and ``reach HOLE`` are unknown. Anything else is kept."""
+
+    folded = fold(reach)
+    if folded in {"", "hole", "reach hole"}:
+        return "reach unknown"
+    return reach.strip()
 
 
 def parse_people(text: str) -> tuple[list[dict], list[str]]:
@@ -113,14 +136,15 @@ def parse_people(text: str) -> tuple[list[dict], list[str]]:
         name, reach, role = parts[0], parts[1], parts[2]
         if not name:
             raise ValueError(f"line {line_no}: name is empty")
+        # name|reach|role|P#|LANG|PRINT...  P# may be an em dash.
         priority = parts[3] if len(parts) > 3 else ""
         language = parts[4] if len(parts) > 4 else ""
-        extra = [part for part in parts[5:] if part]
-        aliases = _aliases(name, extra)
+        printed = [part for part in parts[5:] if part]
+        aliases = _aliases(name, reach)
         identity = "|".join((fold(name), fold(role), fold(reach)))
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
         key = f"archivist-{digest}"
-        signature = "|".join((name, reach, role, priority, language, ",".join(extra)))
+        signature = "|".join((name, reach, role, priority, language, ",".join(printed)))
         if key in seen_keys:
             if seen_keys[key] == signature:
                 notes.append(f"{line_no}: duplicate")
@@ -133,7 +157,7 @@ def parse_people(text: str) -> tuple[list[dict], list[str]]:
             role=role,
             priority=priority,
             language=language,
-            extra=extra,
+            printed=printed,
             aliases=aliases,
             key=key,
             line_no=line_no,
@@ -150,7 +174,7 @@ def _record(
     role: str,
     priority: str,
     language: str,
-    extra: list[str],
+    printed: list[str],
     aliases: list[str],
     key: str,
     line_no: int,
@@ -162,15 +186,15 @@ def _record(
     ]
     if aliases:
         lines.append("Aliases: " + ", ".join(aliases))
-    lines.append(f"Reach: {reach or 'HOLE'}")
+    lines.append(f"Reach: {reach_text(reach)}")
     if role:
         lines.append(f"Role: {role}")
     if priority:
         lines.append(f"Priority: {priority}")
     if language:
         lines.append(f"Language: {language}")
-    if extra:
-        lines.append("Notes: " + " | ".join(extra))
+    if printed:
+        lines.append("Print: " + " | ".join(printed))
     text = "\n".join(lines)
     if len(text) > TEXT_LIMIT:
         text = text[: TEXT_LIMIT - 1].rstrip() + "…"
@@ -270,6 +294,63 @@ def omit_reviewed_copies(people: list[dict], reviewed_keys: set[str]) -> tuple[l
             continue
         kept.append(person)
     return kept, skipped
+
+
+def plain_name(name: str) -> str:
+    """Folded name with parenthetical nicknames removed."""
+
+    return fold(re.sub(r"\([^)]*\)", " ", name))
+
+
+def name_from_content(content: dict) -> str:
+    text = str(content.get("text") or "")
+    for line in text.splitlines():
+        if line.casefold().startswith("name:"):
+            return line.split(":", 1)[1].strip()
+    name = content.get("name")
+    return name.strip() if isinstance(name, str) else ""
+
+
+def plan_remap(people: list[dict], rows: list[dict]) -> dict:
+    """Match file people to archivist rows by folded name. Nothing is deleted.
+
+    ``not_found`` is the count of stored archivist rows whose name is not in
+    the file, including junk header lines such as ``OPS:``. ``missing`` is
+    file people with no stored row.
+    """
+
+    by_name: dict[str, dict] = {}
+    for row in rows:
+        content = row.get("content") or {}
+        if content.get("source") != "archivist-file":
+            continue
+        folded = plain_name(name_from_content(content))
+        if folded:
+            by_name.setdefault(folded, row)
+    file_names: set[str] = set()
+    updated = unchanged = missing = 0
+    changes: list[tuple[dict, dict]] = []
+    for person in people:
+        folded = plain_name(person["name"])
+        file_names.add(folded)
+        row = by_name.get(folded)
+        if row is None:
+            missing += 1
+            continue
+        if person["text"] == str((row.get("content") or {}).get("text") or ""):
+            unchanged += 1
+        else:
+            updated += 1
+            changes.append((person, row))
+    not_found = sorted(name for name in by_name if name not in file_names)
+    return {
+        "updated": updated,
+        "unchanged": unchanged,
+        "not_found": len(not_found),
+        "missing": missing,
+        "not_found_names": not_found,
+        "changes": changes,
+    }
 
 
 def record_bodies(people: list[dict], owner: str) -> list[dict]:
@@ -401,6 +482,115 @@ def load_direct(
     return summary
 
 
+def remap_direct(
+    text: str,
+    *,
+    workspace: str,
+    owner: str,
+    source: str,
+    dry_run: bool,
+    batch_size: int,
+    pause: float,
+) -> dict:
+    """Rewrite archivist people@2 rows from the file. people@1 is not touched.
+
+    Rows are matched by the folded name. Reach, role, priority, language,
+    print and aliases are replaced. reviewed stays false, visibility stays
+    private, and source stays archivist-file. A new current version is what
+    the worker re-embeds. Dry-run only counts.
+    """
+
+    import asyncio
+
+    people, notes = parse_people(text)
+    summary = _summary(people, notes, owner=owner, source=source, dry_run=dry_run)
+    summary["remap"] = True
+
+    from direct_runtime import prepare_engine, workspace_name
+
+    prepare_engine()
+    name = workspace_name(workspace)
+
+    async def run() -> dict:
+        from memseek.config import Settings
+        from memseek.db import pool_lifespan
+        from memseek.definitions import load_definition_catalog
+        from memseek.records import PublicRecordInput, RecordBatchRequest, insert_public_records
+        from memseek.workspace_catalog import WorkspaceCatalogRegistry
+
+        settings = Settings()
+        async with pool_lifespan(settings) as pool:
+            async with pool.connection() as conn:
+                result = await conn.execute(
+                    """
+                    select row.key, row.content
+                    from record row
+                    where row.workspace = %s
+                      and row.entity = %s
+                      and row.collection = 'people'
+                      and row.status = 'active'
+                      and row.content->>'source' = 'archivist-file'
+                      and not coalesce((row.content->>'tombstone')::boolean, false)
+                      and (
+                        row.key is null or not exists (
+                          select 1 from record newer
+                          where newer.workspace = row.workspace
+                            and newer.entity = row.entity
+                            and newer.collection = row.collection
+                            and newer.key = row.key
+                            and newer.status = row.status
+                            and newer.seq > row.seq
+                        )
+                      )
+                    """,
+                    [name, owner],
+                )
+                loaded = await result.fetchall()
+            rows = [
+                {"key": item["key"], "content": item["content"] if isinstance(item["content"], dict) else {}}
+                for item in loaded
+            ]
+            plan = plan_remap(people, rows)
+            summary["updated"] = plan["updated"]
+            summary["unchanged"] = plan["unchanged"]
+            summary["not_found"] = plan["not_found"]
+            summary["missing"] = plan["missing"]
+            summary["not_found_names"] = plan["not_found_names"]
+            if dry_run or not plan["changes"]:
+                return summary
+            registry = WorkspaceCatalogRegistry(pool, settings, load_definition_catalog(settings))
+            catalog = await registry.get(name)
+            bodies = []
+            for person, row in plan["changes"]:
+                revised = dict(person)
+                revised["key"] = row["key"]
+                canonical = json.dumps(
+                    revised["content"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+                revised["dedupe_key"] = (
+                    "archivist:"
+                    + hashlib.sha256(f"{revised['key']}\n{canonical}".encode("utf-8")).hexdigest()
+                )
+                bodies.extend(record_bodies([revised], owner))
+            for start in range(0, len(bodies), batch_size):
+                chunk = bodies[start : start + batch_size]
+                request = RecordBatchRequest(
+                    records=tuple(PublicRecordInput.model_validate(body) for body in chunk)
+                )
+                await insert_public_records(
+                    pool,
+                    workspace=name,
+                    request=request,
+                    catalog=catalog,
+                    settings=settings,
+                )
+                if start + batch_size < len(bodies) and pause:
+                    await asyncio.sleep(pause)
+        return summary
+
+    return asyncio.run(run())
+
+
 def read_source(path: str | None) -> tuple[str, str]:
     """Return ``(text, label)``. ``-`` or an omitted path reads stdin to EOF.
 
@@ -430,6 +620,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--owner", required=True, help="entity the candidates belong to")
     parser.add_argument("--dry-run", action="store_true", help="parse and report; do not write")
     parser.add_argument("--direct", action="store_true", help="use DATABASE_URL, no API key")
+    parser.add_argument(
+        "--remap",
+        action="store_true",
+        help="update existing archivist people@2 rows from this file; requires --direct",
+    )
     parser.add_argument("--workspace", default=os.environ.get("MEMSEEK_WORKSPACE", "personal"))
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--pause", type=float, default=3.0, help="seconds between batches, so the worker is not flooded")
@@ -439,8 +634,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--batch-size must be from 1 to 100")
     if args.pause < 0:
         parser.error("--pause must be >= 0")
+    if args.remap and not args.direct:
+        parser.error("--remap requires --direct")
     text, source = read_source(args.path)
-    if args.direct:
+    if args.remap:
+        summary = remap_direct(
+            text,
+            workspace=args.workspace,
+            owner=args.owner,
+            source=source,
+            dry_run=args.dry_run,
+            batch_size=args.batch_size,
+            pause=args.pause,
+        )
+    elif args.direct:
         summary = load_direct(
             text,
             workspace=args.workspace,

@@ -155,6 +155,20 @@ into the container. A terminal is refused, so an interactive `railway ssh`
 does not hang. Omit the path, or pass `-`, for the same stdin read. A line
 with fewer than three `|` fields is a prose note: it is counted and skipped.
 
+Remap the loaded archivist rows onto the locked columns
+`name|reach|role|P#|LANG|PRINT`. This updates people@2 `archivist-file` rows
+in place, matched by folded name, and leaves people@1 alone. `HOLE` becomes
+`reach unknown`. PRINT is not stored as an alias. `--dry-run` only counts.
+The worker re-embeds each updated row. Junk header rows that are not in the
+file are listed under `not_found` and are not deleted.
+
+```bash
+railway ssh -s api -- python3 /app/scripts/load_people.py \
+  --direct --remap --dry-run --workspace personal --owner <entity> < people.txt
+railway ssh -s api -- python3 /app/scripts/load_people.py \
+  --direct --remap --workspace personal --owner <entity> --batch-size 20 --pause 3 < people.txt
+```
+
 An archivist candidate whose full name or alias copies a reviewed person is
 not returned, and `load_people.py --direct` skips those lines on a later load.
 Count the copies already stored, without deleting any:
@@ -197,9 +211,10 @@ where workspace = 'personal'
 ```
 
 Context for the owner, private included by default. A block that was cut has
-`has_more: true` and a `next_offset`. Call `context` again with that block's
-`*_offset`. `truncated: true` with `has_more: false` is the last page, not a
-dead end.
+`has_more: true` and a `next_offset`. Call `context` again with `offset` set
+to that value, or with that block's `hard_offset`, `context_offset`,
+`people_offset`, `soft_offset`, `style_offset`, or `extended_offset`.
+`truncated: true` with `has_more: false` is the last page, not a dead end.
 
 ```bash
 # owner's own call: visibility omitted, private notes are included

@@ -358,6 +358,41 @@ class PeopleLoader(unittest.TestCase):
         self.assertEqual(summary["inserted"], 0)
         self.assertFalse(summary["reviewed"])
 
+    def test_prose_lines_are_counted_and_a_tty_is_refused(self):
+        text = "\n".join(
+            [
+                "This prose note has no columns and must not abort the load.",
+                "also|short",
+                "Name|reach|role",
+                "Ana Garcia|HOLE|friend",
+            ]
+        )
+        people, notes = load_people.parse_people(text)
+        self.assertEqual(len(people), 1)
+        self.assertEqual(sum(1 for note in notes if note.endswith(": prose")), 2)
+        summary = load_people.load_text(
+            text, owner="owner", source="mem", dry_run=True, batch_size=20, pause=0, url="http://127.0.0.1:9"
+        )
+        self.assertEqual(summary["skipped_prose"], 2)
+        self.assertEqual(summary["parsed"], 1)
+
+        class _Tty:
+            def isatty(self):
+                return True
+
+            def read(self):
+                raise AssertionError("a terminal must not be read")
+
+        import io
+        from unittest.mock import patch
+
+        with patch("sys.stdin", _Tty()), self.assertRaises(SystemExit):
+            load_people.read_source(None)
+        with patch("sys.stdin", io.StringIO("Ana Garcia|HOLE|friend\n")):
+            body, label = load_people.read_source("-")
+        self.assertEqual(label, "stdin")
+        self.assertIn("Ana Garcia", body)
+
 
 class BackfillEstimate(unittest.TestCase):
     def test_cost_is_a_few_cents_for_the_live_corpus(self):

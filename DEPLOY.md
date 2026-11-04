@@ -150,8 +150,10 @@ railway ssh -s api -- python3 /app/scripts/load_people.py \
   --direct --workspace personal --owner <entity> --batch-size 20 --pause 3 < people.txt
 ```
 
-The people file is the process stdin. It is not written into the container.
-Omit the path, or pass `-`, for the same stdin read.
+The people file is the process stdin and is read until EOF. It is not written
+into the container. A terminal is refused, so an interactive `railway ssh`
+does not hang. Omit the path, or pass `-`, for the same stdin read. A line
+with fewer than three `|` fields is a prose note: it is counted and skipped.
 
 Dry-run prints counts and does not call the API. A second run of the same
 file reports duplicates rather than a second current person. Rows are written

@@ -98,19 +98,18 @@ def parse_people(text: str) -> tuple[list[dict], list[str]]:
     people: list[dict] = []
     notes: list[str] = []
     seen_keys: dict[str, str] = {}
-    header_open = True
     for line_no, raw in enumerate(text.splitlines(), start=1):
         if skipped(raw):
             notes.append(f"{line_no}: skipped")
             continue
-        if header_open and is_header(raw):
-            header_open = False
+        if is_header(raw):
             notes.append(f"{line_no}: header")
             continue
-        header_open = False
         parts = [part.strip() for part in raw.split("|")]
+        # Prose notes in the archivist file have no Name|reach|role columns.
         if len(parts) < 3:
-            raise ValueError(f"line {line_no}: expected Name|reach|role, got {len(parts)} fields")
+            notes.append(f"{line_no}: prose")
+            continue
         name, reach, role = parts[0], parts[1], parts[2]
         if not name:
             raise ValueError(f"line {line_no}: name is empty")
@@ -235,6 +234,7 @@ def _summary(people: list[dict], notes: list[str], *, owner: str, source: str, d
         "source": source,
         "parsed": len(people),
         "skipped_or_header": len(notes),
+        "skipped_prose": sum(1 for note in notes if note.endswith(": prose")),
         "activation": "candidate",
         "visibility": "private",
         "source_claim": "archivist-file",
@@ -370,9 +370,19 @@ def load_direct(
 
 
 def read_source(path: str | None) -> tuple[str, str]:
-    """Return ``(text, label)``. ``-`` or an omitted path reads stdin and writes no file."""
+    """Return ``(text, label)``. ``-`` or an omitted path reads stdin to EOF.
+
+    A terminal is refused. ``railway ssh`` allocates a tty when nothing is
+    piped, and reading that tty waits forever. A real pipe ends at EOF and
+    is never written to a file in the container.
+    """
 
     if path in (None, "-"):
+        if getattr(sys.stdin, "isatty", lambda: False)():
+            raise SystemExit(
+                "Refusing to read people from a terminal. "
+                "Pipe the file on stdin so the read stops at EOF."
+            )
         return sys.stdin.read(), "stdin"
     return Path(path).read_text(encoding="utf-8"), path
 

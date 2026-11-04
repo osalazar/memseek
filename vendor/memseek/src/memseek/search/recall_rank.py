@@ -16,6 +16,11 @@ from memseek.search.names import NAME_ACCEPT, lexical_overlap, name_score
 # is not evidence the row is about the task. Keyword and name hits do not
 # need to clear it.
 SEMANTIC_ACCEPT = 0.28
+# People search uses a higher bar. Short name embeddings share a cone, so a
+# nonsense query still clears 0.28 for hundreds of candidates. Only a
+# near-paraphrase is allowed in on cosine alone.
+PEOPLE_COSINE_MIN = 0.82
+PEOPLE_PAGE = 5
 # Always included, ahead of task matches: the highest-priority hard rules.
 CORE_SIZE = 12
 # When an owner has at most this many visible notes, matching returns them
@@ -280,6 +285,24 @@ def label_unreviewed_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, A
     return labelled
 
 
+def _people_kept(row: Mapping[str, Any], query: str) -> tuple[bool, float]:
+    """Every people hit clears a minimum score. Weak vector neighbors do not.
+
+    A strong name (exact, fuzzy, or alias, accents folded) is enough. A
+    vector-only or similarity-only hit must clear ``PEOPLE_COSINE_MIN``.
+    Keyword overlap in the biography is not a people match.
+    """
+
+    content = row.get("content") or {}
+    named = name_score(query, content)
+    similarity = _number(row.get("similarity"))
+    if named >= NAME_ACCEPT:
+        return True, named
+    if similarity >= PEOPLE_COSINE_MIN:
+        return True, named
+    return False, named
+
+
 def select_people(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -292,10 +315,11 @@ def select_people(
     """Owner people, including unreviewed archivist candidates.
 
     Exact, alias, and fuzzy accent-folded name matches sort above semantic
-    and keyword matches. On equal match strength an owner-reviewed person
-    ranks above a candidate. A query that names nobody and does not clear
-    the semantic or keyword bar returns an empty page. Shareable scope and
-    other entities never receive a private candidate.
+    hits. On equal match strength an owner-reviewed person ranks above a
+    candidate. Vector-only neighbors must clear a high cosine gate, so a
+    nonsense query returns nobody. The page is at most ``PEOPLE_PAGE`` hits;
+    ``offset`` walks the rest. Shareable scope and other entities never
+    receive a private candidate.
     """
 
     visible = [
@@ -306,9 +330,8 @@ def select_people(
     ]
     scored: list[tuple[Mapping[str, Any], float]] = []
     for row in visible:
-        content = row.get("content") or {}
-        named = name_score(query, content)
-        if named >= NAME_ACCEPT or _matches_task(row, query):
+        keep, named = _people_kept(row, query)
+        if keep:
             scored.append((row, named))
     scored.sort(
         key=lambda item: (
@@ -320,4 +343,5 @@ def select_people(
             str(item[0]["id"]),
         )
     )
-    return _page([row for row, _score in scored], offset, limit, ())
+    page_limit = min(limit, PEOPLE_PAGE) if limit else PEOPLE_PAGE
+    return _page([row for row, _score in scored], offset, page_limit, ())

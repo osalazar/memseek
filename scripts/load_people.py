@@ -242,7 +242,34 @@ def _summary(people: list[dict], notes: list[str], *, owner: str, source: str, d
         "keys": [person["key"] for person in people],
         "inserted": 0,
         "duplicates": 0,
+        "skipped_reviewed": 0,
     }
+
+
+def omit_reviewed_copies(people: list[dict], reviewed_keys: set[str]) -> tuple[list[dict], int]:
+    """Drop candidates whose name or alias copies a reviewed person.
+
+    ``reviewed_keys`` are folded full forms from people already on file.
+    The caller does not delete those rows.
+    """
+
+    if not reviewed_keys:
+        return list(people), 0
+    from memseek.search.names import name_identity
+
+    kept: list[dict] = []
+    skipped = 0
+    for person in people:
+        content = {
+            "name": person.get("name") or "",
+            "aliases": person.get("aliases") or [],
+            "text": person.get("text") or "",
+        }
+        if name_identity(content) & reviewed_keys:
+            skipped += 1
+            continue
+        kept.append(person)
+    return kept, skipped
 
 
 def record_bodies(people: list[dict], owner: str) -> list[dict]:
@@ -313,26 +340,25 @@ def load_direct(
     batch_size: int,
     pause: float,
 ) -> dict:
-    """Write candidates through the database. Dry-run never opens it.
+    """Write candidates through the database. Dry-run reads names and does not write.
 
     The text is the people file itself. Callers streaming over ssh pass stdin
-    and this function does not create a file.
+    and this function does not create a file. A candidate whose name or alias
+    copies a reviewed person for this owner is skipped.
     """
 
     import asyncio
 
     people, notes = parse_people(text)
     summary = _summary(people, notes, owner=owner, source=source, dry_run=dry_run)
-    if dry_run:
-        return summary
 
     from direct_runtime import prepare_engine, workspace_name
 
     prepare_engine()
     name = workspace_name(workspace)
-    bodies = record_bodies(people, owner)
 
     async def run() -> tuple[int, int]:
+        from check_people_duplicates import reviewed_name_keys
         from memseek.config import Settings
         from memseek.db import pool_lifespan
         from memseek.definitions import load_definition_catalog
@@ -343,8 +369,14 @@ def load_direct(
         inserted = 0
         duplicates = 0
         async with pool_lifespan(settings) as pool:
+            reviewed = await reviewed_name_keys(pool, workspace=name, owner=owner)
+            kept, skipped = omit_reviewed_copies(people, reviewed)
+            summary["skipped_reviewed"] = skipped
+            if dry_run:
+                return 0, 0
             registry = WorkspaceCatalogRegistry(pool, settings, load_definition_catalog(settings))
             catalog = await registry.get(name)
+            bodies = record_bodies(kept, owner)
             for start in range(0, len(bodies), batch_size):
                 chunk = bodies[start : start + batch_size]
                 request = RecordBatchRequest(

@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from memseek.search.names import lexical_overlap, name_forms, name_match, name_score
+from memseek.search.names import lexical_overlap, name_forms, name_identity, name_match, name_score
 
 # Cosine similarity on text-embedding-3-small. Below this, a vector neighbor
 # is not evidence the row is about the task. Keyword and name hits do not
@@ -374,12 +374,29 @@ def _people_reason(
     return True, named, "vector"
 
 
+def _hides_as_duplicate(content: Mapping[str, Any], reviewed_keys: set[str]) -> bool:
+    """An archivist candidate whose name or alias copies a reviewed person.
+
+    Reviewed rows stay. The comparison is the folded full form, so a shared
+    given name alone does not hide anyone. Nothing is deleted.
+    """
+
+    if _owner_reviewed(content) or content.get("source") != "archivist-file":
+        return False
+    return bool(name_identity(content) & reviewed_keys)
+
+
 def _people_decisions(
     visible: Sequence[Mapping[str, Any]],
     query: str,
 ) -> list[tuple[Mapping[str, Any], bool, float, str]]:
     """Classify visible people. Fallback applies only when nothing fully matches."""
 
+    reviewed_keys: set[str] = set()
+    for row in visible:
+        content = row.get("content") or {}
+        if _owner_reviewed(content):
+            reviewed_keys.update(name_identity(content))
     kinds = [name_match(query, row.get("content") or {}) for row in visible]
     use_fallback = not any(kind in {"exact", "all"} for kind in kinds)
     mean, _stdev = _corpus_similarity(visible)
@@ -392,6 +409,10 @@ def _people_decisions(
             others=_next_similarity(visible, str(row.get("id"))),
             use_fallback=use_fallback,
         )
+        content = row.get("content") or {}
+        if keep and _hides_as_duplicate(content, reviewed_keys):
+            keep = False
+            reason = "duplicate"
         decisions.append((row, keep, score, reason))
     return decisions
 

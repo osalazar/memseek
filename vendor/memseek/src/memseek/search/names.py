@@ -2,8 +2,10 @@
 
 Tokens come from the person's name and from real aliases. An alias phrase
 that starts with ``not``, ``no``, ``ex``, or ``not other`` is a negative and
-is ignored. Notes and biography text are not names. A prose record with no
-structured name still yields the clause before ``is`` (``Alex A is a coach``).
+is ignored. Notes and biography text are not names. A people record with no
+structured name still yields its leading name phrase, including a
+parenthesised nickname (``Sebastian (Sebas). Owner reviewed``) or the
+clause before ``is`` (``Alex A is a coach``).
 Titles and function words do not count. Comparison folds case and accents,
 so ``Alcivar`` matches ``Alcívar``.
 """
@@ -93,6 +95,34 @@ _STOP = frozenset(
 # Alias phrases that begin with one of these are negatives ("not Chloe"),
 # not other names for the person.
 _NEGATIVE_ALIAS = frozenset({"not", "no", "ex"})
+# A period after one of these is an abbreviation, not the end of the name.
+_ABBREV = frozenset({"dr", "dra", "mr", "mrs", "ms", "sr", "sra", "prof", "ing", "lic", "don", "dona"})
+# Relationship labels inside a nickname, not a second person.
+_ROLE_LABELS = frozenset(
+    {
+        "father",
+        "mother",
+        "dad",
+        "mom",
+        "wife",
+        "husband",
+        "son",
+        "daughter",
+        "brother",
+        "sister",
+        "parent",
+        "parents",
+        "padre",
+        "madre",
+        "esposo",
+        "esposa",
+        "hijo",
+        "hija",
+        "papa",
+        "mama",
+        "friend",
+    }
+)
 _NAME_LINE = re.compile(r"(?im)^name:\s*(.+?)\s*$")
 _ALIAS_LINE = re.compile(r"(?im)^aliases:\s*(.+?)\s*$")
 
@@ -194,10 +224,67 @@ def _name_pieces(name: str) -> list[str]:
     if outside and not _negative_alias(outside):
         pieces.append(outside)
     for inner in re.findall(r"\(([^)]*)\)", name):
-        inner = inner.strip()
-        if inner and not _negative_alias(inner):
-            pieces.append(inner)
+        pieces.extend(_nickname_phrases(inner))
     return pieces
+
+
+def _nickname_phrases(inner: str) -> list[str]:
+    """Comma-separated nicknames. A bare role label such as ``father`` is not one."""
+
+    phrases: list[str] = []
+    for part in re.split(r"[,;/]", inner):
+        phrase = part.strip()
+        if not phrase or _negative_alias(phrase):
+            continue
+        tokens = _name_tokens(phrase)
+        if not tokens or all(token in _ROLE_LABELS for token in tokens):
+            continue
+        phrases.append(phrase)
+    return phrases
+
+
+def _word_before(text: str, index: int) -> str:
+    cursor = index - 1
+    while cursor >= 0 and text[cursor].isspace():
+        cursor -= 1
+    end = cursor + 1
+    while cursor >= 0 and text[cursor].isalpha():
+        cursor -= 1
+    return text[cursor + 1 : end].casefold()
+
+
+def _leading_name_phrase(head: str) -> str | None:
+    """Name at the start of a people@1 sentence, nicknames included.
+
+    ``Sebastian (Sebas). Owner reviewed`` stops before the period.
+    ``Dr. Elizabeth`` keeps the abbreviation. ``Alex A is a coach`` stops
+    before `` is ``.
+    """
+
+    depth = 0
+    start = 0
+    while start < len(head) and head[start].isspace():
+        start += 1
+    index = start
+    folded = head.casefold()
+    while index < len(head):
+        char = head[index]
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth:
+            depth -= 1
+        elif depth == 0:
+            if folded.startswith(" is ", index) or folded.startswith(" owner reviewed", index):
+                phrase = head[start:index].strip()
+                return phrase or None
+            if char == "." and _word_before(head, index) not in _ABBREV:
+                phrase = head[start:index].strip()
+                return phrase or None
+        index += 1
+    phrase = head[start:].strip()
+    if not phrase or len(phrase) > 160:
+        return None
+    return phrase
 
 
 def _alias_phrases(value: str) -> list[str]:
@@ -210,16 +297,33 @@ def _alias_phrases(value: str) -> list[str]:
 
 
 def _prose_name(text: str) -> str | None:
-    """Leading ``Name is ...`` clause, when the record has no structured name."""
+    """Leading name phrase when the record has no structured name field."""
 
-    head = text.strip().splitlines()[0] if text.strip() else ""
-    marker = head.casefold().find(" is ")
-    if marker <= 0:
+    stripped = text.strip()
+    if not stripped:
         return None
-    name = head[:marker].strip()[:160]
-    if not name or _negative_alias(name):
+    phrase = _leading_name_phrase(stripped.splitlines()[0])
+    if not phrase or _negative_alias(phrase):
         return None
-    return name
+    if "unreviewed" in phrase.casefold():
+        return None
+    return phrase[:160]
+
+
+def name_identity(content: Mapping[str, object]) -> set[str]:
+    """Folded full names and aliases that name this one person.
+
+    Used to notice that an archivist candidate is a copy of a reviewed
+    person. Comparison is the whole form, not a single shared token, so
+    ``Sebastian Ortega`` is not the same form as ``Sebastian``.
+    """
+
+    keys: set[str] = set()
+    for form in name_forms(content):
+        folded = fold_name(form)
+        if folded and _name_tokens(form):
+            keys.add(folded)
+    return keys
 
 
 def name_forms(content: Mapping[str, object]) -> list[str]:

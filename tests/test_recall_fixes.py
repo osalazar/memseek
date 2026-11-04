@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / "vendor" / "memseek" / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from memseek.artifacts import continue_block
-from memseek.search.names import fold_name, name_score
+from memseek.search.names import fold_name, name_identity, name_score
 from memseek.search.recall import recall_debug_enabled
 from memseek.search.recall_rank import label_unreviewed_text, select_context, select_people, select_rules
 
@@ -242,7 +242,8 @@ class PeopleNames(unittest.TestCase):
         page = select_people(
             rows, query="Dra. Barba", now=1, visibility={"private", "shareable"}, offset=0, limit=6
         )
-        self.assertEqual(page.ids, ("reviewed-barba", "file-barba"))
+        self.assertEqual(page.ids, ("reviewed-barba",))
+        self.assertNotIn("file-barba", page.ids)
         self.assertNotIn("guess", page.ids)
         self.assertIn("(unreviewed)", label_unreviewed_text(candidate["content"]).casefold())
 
@@ -369,6 +370,53 @@ class PeopleNames(unittest.TestCase):
         )
         self.assertEqual(missed.ids, ())
 
+    def test_reviewed_prose_name_hides_the_archivist_copy(self):
+        def reviewed(identity, text):
+            row = person(identity, text)
+            row["content"]["activation"] = "confirmed"
+            return row
+
+        def copy(identity, text):
+            row = person(identity, text, activation="candidate", seq=9)
+            row["content"]["source"] = "archivist-file"
+            row["content"]["reviewed"] = False
+            return row
+
+        rows = [
+            reviewed("sebas", "Sebastian (Sebas). Owner reviewed. Lives in Quito."),
+            copy("sebas-file", "Name: Sebastian\nAliases: Sebas\nNotes: in-person meeting"),
+            copy("other-sebas", "Name: Sebastian Paz\nRole: neighbor"),
+            reviewed("osp", "OSP (Oscar Salazar, father). Owner reviewed this record."),
+            copy("osp-file", "Name: OSP\nRole: parent"),
+            copy("oscar-file", "Name: Oscar Salazar\nRole: parent"),
+            reviewed("edwin", "Edwin Campbell. Owner reviewed."),
+            copy("edwin-file", "Name: Edwin Campbell\nRole: colleague"),
+            copy("notes", "Name: Paz Andrade\nNotes: in-person meeting\nAliases: not Chloe Gray"),
+        ]
+        sebas = select_people(
+            rows, query="Sebas", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(sebas.ids[0], "sebas")
+        self.assertNotIn("sebas-file", sebas.ids)
+
+        osp = select_people(rows, query="OSP", now=1, visibility={"private"}, offset=0, limit=10)
+        self.assertEqual(osp.ids, ("osp",))
+
+        edwin = select_people(
+            rows, query="Edwin Campbell", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(edwin.ids, ("edwin",))
+
+        nonsense = select_people(
+            rows, query="zzzz-not-a-person", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(nonsense.ids, ())
+        self.assertEqual(
+            name_score("Sebas", {"text": "Sebastian (Sebas). Owner reviewed."}),
+            1.0,
+        )
+        self.assertIn("oscar salazar", name_identity({"text": "OSP (Oscar Salazar, father). Owner reviewed."}))
+
     def test_recall_debug_is_owner_only_and_off_by_default(self):
         class _Settings:
             recall_debug = False
@@ -492,6 +540,57 @@ class PeopleLoader(unittest.TestCase):
         )
         self.assertEqual(summary["skipped_prose"], 2)
         self.assertEqual(summary["parsed"], 1)
+
+    def test_loader_skips_a_name_already_reviewed(self):
+        import check_people_duplicates
+
+        text = "\n".join(
+            [
+                "Edwin Campbell|HOLE|colleague",
+                "Ana Garcia|HOLE|friend",
+            ]
+        )
+        people, _notes = load_people.parse_people(text)
+        kept, skipped = load_people.omit_reviewed_copies(people, {"edwin campbell"})
+        self.assertEqual(skipped, 1)
+        self.assertEqual([person["name"] for person in kept], ["Ana Garcia"])
+        rows = [
+            {
+                "entity": "owner",
+                "id": "reviewed",
+                "content": {
+                    "text": "Edwin Campbell. Owner reviewed.",
+                    "activation": "confirmed",
+                    "visibility": "private",
+                    "valid_until": FOREVER,
+                },
+            },
+            {
+                "entity": "owner",
+                "id": "copy",
+                "content": {
+                    "text": "Name: Edwin Campbell\nRole: colleague",
+                    "activation": "candidate",
+                    "source": "archivist-file",
+                    "reviewed": False,
+                    "visibility": "private",
+                    "valid_until": FOREVER,
+                },
+            },
+            {
+                "entity": "owner",
+                "id": "other",
+                "content": {
+                    "text": "Name: Ana Garcia\nRole: friend",
+                    "activation": "candidate",
+                    "source": "archivist-file",
+                    "reviewed": False,
+                    "visibility": "private",
+                    "valid_until": FOREVER,
+                },
+            },
+        ]
+        self.assertEqual(check_people_duplicates.count_duplicate_candidates(rows), {"duplicates": 1})
 
         class _Tty:
             def isatty(self):

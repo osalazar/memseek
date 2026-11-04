@@ -155,6 +155,14 @@ into the container. A terminal is refused, so an interactive `railway ssh`
 does not hang. Omit the path, or pass `-`, for the same stdin read. A line
 with fewer than three `|` fields is a prose note: it is counted and skipped.
 
+An archivist candidate whose full name or alias copies a reviewed person is
+not returned, and `load_people.py --direct` skips those lines on a later load.
+Count the copies already stored, without deleting any:
+
+```
+railway ssh -s api -- python3 /app/scripts/check_people_duplicates.py --direct --owner OWNER
+```
+
 People score debug is off. Set `RECALL_DEBUG=true` on the api and restart it
 to log the top cosines for an owner people search and to attach them on
 `recall.debug`. A shareable-only call does not receive that list. Unreviewed

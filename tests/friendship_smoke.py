@@ -15,7 +15,7 @@ async def test_friendship(mem):
     assert len((await query(owner,['private']))['hits'])==1
     assert not (await query(owner,['shareable']))['hits']
     assert not (await query('other-owner',['private']))['hits']
-    frame={'task':'Who are my close friends? Synthetic Alex?', 'actions':['research'],'channels':['web'],'audiences':['self'],'recipients':['none'],'domains':['personal']}
+    frame={'task':'Synthetic Alex', 'actions':['research'],'channels':['web'],'audiences':['self'],'recipients':['none'],'domains':['personal']}
     kit=PersonalContext(mem,owner)
     assert 'UNCONFIRMED INFERENCE' not in (await kit.prepare(frame=frame,outward=False,flush=False)).content
     await review_suggestion(mem,owner,'friend-a','confirmed','Synthetic Alex is my close friend.')

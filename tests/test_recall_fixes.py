@@ -262,6 +262,113 @@ class PeopleNames(unittest.TestCase):
         )
         self.assertEqual(page.ids[0], "named")
 
+    def test_nonsense_ignores_negative_aliases_notes_and_loose_fuzzy(self):
+        def record(identity, name, aliases="", notes="", **kwargs):
+            lines = [f"Name: {name}"]
+            if aliases:
+                lines.append(f"Aliases: {aliases}")
+            if notes:
+                lines.append(f"Notes: {notes}")
+            lines.append("Role: neighbor")
+            return person(identity, "\n".join(lines), **kwargs)
+
+        rows = [
+            record("osp", "OSP", aliases="not Chloe Gray, not other Juliens", notes="in-person meeting"),
+            record("sebas", "Sebastian Ortega", aliases="Sebas, not other Juliens"),
+            record("paz", "Paz Andrade", notes="met in-person last year"),
+            record("persson", "Lars Persson"),
+            record("gerson", "Rick Gerson"),
+            record("chloe", "Chloe Gray", aliases="not Chloe Gray"),
+        ]
+        miss = select_people(
+            rows, query="zzzz-not-a-person", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(miss.total, 0)
+        self.assertEqual(miss.ids, ())
+        self.assertEqual(name_score("zzzz-not-a-person", rows[0]["content"]), 0.0)
+        self.assertEqual(name_score("person", {"name": "Lars Persson"}), 0.0)
+        self.assertEqual(name_score("person", {"name": "Rick Gerson"}), 0.0)
+        self.assertEqual(name_score("Gerson", {"name": "Lars Persson"}), 0.0)
+        self.assertGreaterEqual(name_score("Barva", {"name": "Elizabeth Barba"}), 0.9)
+
+    def test_full_name_beats_a_shared_given_name(self):
+        rows = [
+            person("full", "Name: Juan Diego Caballero"),
+            person("longer", "Name: Juan Diego Caballero de la Vega"),
+            person("juan", "Name: Juan Perez"),
+            person("partial", "Name: Diego Caballero"),
+            person("other", "Name: Maria Lopez"),
+        ]
+        page = select_people(
+            rows,
+            query="Juan Diego Caballero",
+            now=1,
+            visibility={"private"},
+            offset=0,
+            limit=10,
+        )
+        self.assertEqual(page.ids, ("full", "longer"))
+
+        only_partial = select_people(
+            rows[2:],
+            query="Juan Diego Caballero",
+            now=1,
+            visibility={"private"},
+            offset=0,
+            limit=10,
+        )
+        self.assertEqual(only_partial.ids, ("partial",))
+
+    def test_barba_alcivar_edwin_and_sebas_rank_the_right_person_first(self):
+        rows = [
+            person("barba", "Name: Dra. Elizabeth Barba Orozco\nAliases: Dra. Barba"),
+            person("other-barba", "Name: Elena Barba", activation="candidate"),
+            person("alcivar", "Name: Cristian Alcívar Conde"),
+            person("other-alcivar", "Name: Maria Alcivar", activation="candidate"),
+            person("edwin", "Name: Edwin Campbell"),
+            person("edwin-other", "Name: Edwin Morales"),
+            person("campbell", "Name: Ana Campbell"),
+            person("sebas", "Name: Sebastian Ortega\nAliases: Sebas"),
+            person("sebastian", "Name: Sebastian Paz", activation="candidate"),
+        ]
+        rows[6]["content"]["source"] = "archivist-file"
+        rows[1]["content"]["source"] = "archivist-file"
+        rows[1]["content"]["reviewed"] = False
+        rows[3]["content"]["source"] = "archivist-file"
+        rows[3]["content"]["reviewed"] = False
+        rows[8]["content"]["source"] = "archivist-file"
+        rows[8]["content"]["reviewed"] = False
+        for query, first in (
+            ("Barba", "barba"),
+            ("Alcívar", "alcivar"),
+            ("Edwin Campbell", "edwin"),
+            ("Sebas", "sebas"),
+        ):
+            page = select_people(
+                rows, query=query, now=1, visibility={"private"}, offset=0, limit=10
+            )
+            self.assertGreaterEqual(len(page.ids), 1, query)
+            self.assertEqual(page.ids[0], first, query)
+        edwin = select_people(
+            rows, query="Edwin Campbell", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(edwin.ids, ("edwin",))
+
+        prose = person("alex", "Alex A is an executive coach. PRIVATE_PEOPLE_MARKER.")
+        found = select_people(
+            [prose], query="Who is Alex?", now=1, visibility={"private"}, offset=0, limit=5
+        )
+        self.assertEqual(found.ids, ("alex",))
+        missed = select_people(
+            [prose],
+            query="Who is Alex, my executive coach?",
+            now=1,
+            visibility={"private"},
+            offset=0,
+            limit=5,
+        )
+        self.assertEqual(missed.ids, ())
+
     def test_recall_debug_is_owner_only_and_off_by_default(self):
         class _Settings:
             recall_debug = False

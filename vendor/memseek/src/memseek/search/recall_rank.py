@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from memseek.search.names import NAME_ACCEPT, lexical_overlap, name_forms, name_score
+from memseek.search.names import lexical_overlap, name_forms, name_match, name_score
 
 # Cosine similarity on text-embedding-3-small. Below this, a vector neighbor
 # is not evidence the row is about the task. Keyword and name hits do not
@@ -336,25 +336,32 @@ def _next_similarity(rows: Sequence[Mapping[str, Any]], row_id: str) -> float | 
     return best
 
 
+_NAME_TIER = {"exact": 3, "all": 2, "fallback": 1}
+_NAME_SCORE = {"exact": 1.0, "all": 0.95, "fallback": 0.85}
+
+
 def _people_reason(
     row: Mapping[str, Any],
     query: str,
     *,
     mean: float,
     others: float | None,
+    use_fallback: bool,
 ) -> tuple[bool, float, str]:
     """Why a visible person is kept or dropped.
 
-    Unreviewed archivist candidates need a lexical name match. A reviewed
-    vector-only hit needs cosine at least ``PEOPLE_VECTOR_MIN``, a margin
-    over the corpus mean, and a gap over the next cosine so a hub cluster
-    is dropped together.
+    A full name match outranks every token matching, which outranks a
+    one-token miss. That miss is used only when nobody matched in full.
+    Unreviewed candidates still need a lexical name. A reviewed vector-only
+    hit needs cosine at least ``PEOPLE_VECTOR_MIN``, a margin over the corpus
+    mean, and a gap over the next cosine so a hub cluster is dropped.
     """
 
     content = row.get("content") or {}
+    kind = name_match(query, content)
+    if kind in {"exact", "all"} or (kind == "fallback" and use_fallback):
+        return True, _NAME_SCORE[kind], kind
     named = name_score(query, content)
-    if named >= NAME_ACCEPT:
-        return True, named, "lexical"
     if not _owner_reviewed(content):
         return False, named, "rejected-unreviewed"
     similarity = _similarity(row)
@@ -365,6 +372,28 @@ def _people_reason(
     if others is not None and similarity - others < PEOPLE_VECTOR_GAP:
         return False, named, "rejected-gap"
     return True, named, "vector"
+
+
+def _people_decisions(
+    visible: Sequence[Mapping[str, Any]],
+    query: str,
+) -> list[tuple[Mapping[str, Any], bool, float, str]]:
+    """Classify visible people. Fallback applies only when nothing fully matches."""
+
+    kinds = [name_match(query, row.get("content") or {}) for row in visible]
+    use_fallback = not any(kind in {"exact", "all"} for kind in kinds)
+    mean, _stdev = _corpus_similarity(visible)
+    decisions: list[tuple[Mapping[str, Any], bool, float, str]] = []
+    for row, _kind in zip(visible, kinds, strict=True):
+        keep, score, reason = _people_reason(
+            row,
+            query,
+            mean=mean,
+            others=_next_similarity(visible, str(row.get("id"))),
+            use_fallback=use_fallback,
+        )
+        decisions.append((row, keep, score, reason))
+    return decisions
 
 
 def select_people(
@@ -378,8 +407,8 @@ def select_people(
 ) -> RecallPage:
     """Owner people, including unreviewed archivist candidates.
 
-    Exact, alias, and fuzzy accent-folded name matches sort above vector
-    hits. On equal match strength an owner-reviewed person ranks above a
+    A full-name match ranks above every token matching, which ranks above a
+    one-token miss. On equal strength an owner-reviewed person ranks above a
     candidate. Unreviewed candidates match on the name only. A reviewed
     vector hit must clear 0.90 and stand away from the corpus, so hub
     vectors and a nonsense query return nobody. The page is at most
@@ -387,26 +416,22 @@ def select_people(
     """
 
     visible = _visible_people(rows, now=now, visibility=visibility)
-    mean, _stdev = _corpus_similarity(visible)
-    scored: list[tuple[Mapping[str, Any], float]] = []
-    for row in visible:
-        keep, named, _reason = _people_reason(
-            row, query, mean=mean, others=_next_similarity(visible, str(row.get("id")))
-        )
+    scored: list[tuple[Mapping[str, Any], float, str]] = []
+    for row, keep, named, reason in _people_decisions(visible, query):
         if keep:
-            scored.append((row, named))
+            scored.append((row, named, reason))
     scored.sort(
         key=lambda item: (
-            -(1 if item[1] >= NAME_ACCEPT else 0),
+            -_NAME_TIER.get(item[2], 0),
+            -(1 if _owner_reviewed(item[0].get("content") or {}) else 0),
             -item[1],
             -relevance(item[0], query),
-            -(1 if _owner_reviewed(item[0].get("content") or {}) else 0),
             -_seq(item[0]),
             str(item[0]["id"]),
         )
     )
     page_limit = min(limit, PEOPLE_PAGE) if limit else PEOPLE_PAGE
-    return _page([row for row, _score in scored], offset, page_limit, ())
+    return _page([row for row, _score, _reason in scored], offset, page_limit, ())
 
 
 def people_debug(
@@ -422,12 +447,9 @@ def people_debug(
     visible = _visible_people(rows, now=now, visibility=visibility)
     mean, stdev = _corpus_similarity(visible)
     explained: list[dict[str, Any]] = []
-    for row in visible:
+    for row, keep, named, reason in _people_decisions(visible, query):
         content = row.get("content") or {}
         forms = name_forms(content)
-        keep, named, reason = _people_reason(
-            row, query, mean=mean, others=_next_similarity(visible, str(row.get("id")))
-        )
         similarity = _similarity(row)
         z_score = None
         if similarity is not None and stdev > 1e-9:

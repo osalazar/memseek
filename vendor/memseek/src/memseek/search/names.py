@@ -1,9 +1,11 @@
 """Accent-insensitive name matching for people records.
 
-A match can come from an explicit name, an alias, a ``Name:`` / ``Aliases:``
-header inside the text, or the leading clause of a prose note. Titles and
-function words do not count as names. Comparison folds case and accents, so
-``Alcivar`` matches ``Alcívar``.
+Tokens come from the person's name and from real aliases. An alias phrase
+that starts with ``not``, ``no``, ``ex``, or ``not other`` is a negative and
+is ignored. Notes and biography text are not names. A prose record with no
+structured name still yields the clause before ``is`` (``Alex A is a coach``).
+Titles and function words do not count. Comparison folds case and accents,
+so ``Alcivar`` matches ``Alcívar``.
 """
 
 from __future__ import annotations
@@ -82,8 +84,15 @@ _STOP = frozenset(
         "please",
         "find",
         "search",
+        "not",
+        "no",
+        "person",
+        "people",
     }
 )
+# Alias phrases that begin with one of these are negatives ("not Chloe"),
+# not other names for the person.
+_NEGATIVE_ALIAS = frozenset({"not", "no", "ex"})
 _NAME_LINE = re.compile(r"(?im)^name:\s*(.+?)\s*$")
 _ALIAS_LINE = re.compile(r"(?im)^aliases:\s*(.+?)\s*$")
 
@@ -123,6 +132,8 @@ def levenshtein(left: str, right: str) -> int:
 
 
 def _query_tokens(query: str) -> list[str]:
+    """Tokens for keyword overlap. Name search uses :func:`_name_tokens`."""
+
     return [
         token
         for token in fold_name(query).split()
@@ -130,44 +141,110 @@ def _query_tokens(query: str) -> list[str]:
     ]
 
 
+def _name_tokens(value: str) -> list[str]:
+    """Significant name tokens. Stop words and one-character tokens are out."""
+
+    return [
+        token
+        for token in fold_name(value).split()
+        if token not in _TITLES and token not in _STOP and len(token) >= 2
+    ]
+
+
 def _fuzzy_token(query: str, candidate: str) -> bool:
+    """One substitution on a token of 5 or more characters.
+
+    The tokens must be the same length and share a first letter. That keeps a
+    trailing or internal typo (``Barva`` / ``Barba``) and rejects ``person``
+    against ``Persson`` (an insertion) and ``Gerson`` (a different letter).
+    """
+
+    if len(query) < 5 or len(candidate) < 5:
+        return False
+    if len(query) != len(candidate) or query[0] != candidate[0]:
+        return False
+    return levenshtein(query, candidate) <= 1
+
+
+def _token_match(query: str, candidate: str) -> bool:
+    """Exact, a prefix of 3 or more characters, or a tight fuzzy match."""
+
     if query == candidate:
         return True
-    if len(query) < 4 or len(candidate) < 4:
-        return False
-    distance = levenshtein(query, candidate)
-    if len(query) >= 8:
-        return distance <= 2
-    return distance <= 1
+    shorter, longer = (query, candidate) if len(query) <= len(candidate) else (candidate, query)
+    if len(shorter) >= 3 and longer.startswith(shorter):
+        return True
+    return _fuzzy_token(query, candidate)
+
+
+def _negative_alias(phrase: str) -> bool:
+    tokens = fold_name(phrase).split()
+    if not tokens:
+        return True
+    if tokens[0] in _NEGATIVE_ALIAS:
+        return True
+    return len(tokens) >= 2 and tokens[0] == "not" and tokens[1] == "other"
+
+
+def _name_pieces(name: str) -> list[str]:
+    """The name outside parentheses, plus parenthetical aliases that are real."""
+
+    pieces: list[str] = []
+    outside = re.sub(r"\([^)]*\)", " ", name).strip()
+    if outside and not _negative_alias(outside):
+        pieces.append(outside)
+    for inner in re.findall(r"\(([^)]*)\)", name):
+        inner = inner.strip()
+        if inner and not _negative_alias(inner):
+            pieces.append(inner)
+    return pieces
+
+
+def _alias_phrases(value: str) -> list[str]:
+    phrases: list[str] = []
+    for part in re.split(r"[,;/]", value):
+        phrase = part.strip()
+        if phrase and not _negative_alias(phrase):
+            phrases.append(phrase)
+    return phrases
+
+
+def _prose_name(text: str) -> str | None:
+    """Leading ``Name is ...`` clause, when the record has no structured name."""
+
+    head = text.strip().splitlines()[0] if text.strip() else ""
+    marker = head.casefold().find(" is ")
+    if marker <= 0:
+        return None
+    name = head[:marker].strip()[:160]
+    if not name or _negative_alias(name):
+        return None
+    return name
 
 
 def name_forms(content: Mapping[str, object]) -> list[str]:
-    """Name strings a people record can be matched against, in priority order."""
+    """Name and real alias strings. Notes and biography text are not included."""
 
     forms: list[str] = []
     name = content.get("name")
     if isinstance(name, str) and name.strip():
-        forms.append(name.strip())
+        forms.extend(_name_pieces(name))
     aliases = content.get("aliases")
     if isinstance(aliases, list):
-        forms.extend(
-            item.strip() for item in aliases if isinstance(item, str) and item.strip()
-        )
+        for item in aliases:
+            if isinstance(item, str) and item.strip() and not _negative_alias(item):
+                forms.extend(_name_pieces(item))
     text = content.get("text")
     if isinstance(text, str) and text.strip():
         for match in _NAME_LINE.finditer(text):
-            forms.append(match.group(1).strip())
+            forms.extend(_name_pieces(match.group(1)))
         for match in _ALIAS_LINE.finditer(text):
-            forms.extend(
-                part.strip() for part in re.split(r"[,;/]", match.group(1)) if part.strip()
-            )
+            for phrase in _alias_phrases(match.group(1)):
+                forms.extend(_name_pieces(phrase))
         if not forms:
-            head = text.strip().splitlines()[0]
-            folded_head = head.casefold()
-            marker = folded_head.find(" is ")
-            if marker > 0:
-                head = head[:marker]
-            forms.append(head[:160])
+            prose = _prose_name(text)
+            if prose:
+                forms.extend(_name_pieces(prose))
     seen: set[str] = set()
     unique: list[str] = []
     for form in forms:
@@ -178,47 +255,50 @@ def name_forms(content: Mapping[str, object]) -> list[str]:
     return unique
 
 
+def name_match(query: str, content: Mapping[str, object]) -> str:
+    """How ``query`` names this record: ``exact``, ``all``, ``fallback``, or ``none``.
+
+    Every significant query token must match a name token (exact, a prefix of
+    3 or more characters, or a one-edit fuzzy match). ``fallback`` means the
+    query has at least three significant tokens, all but one match, and the
+    longest token is among the matches. The caller uses fallback only when
+    nobody matched in full.
+    """
+
+    query_tokens = _name_tokens(query)
+    if not query_tokens:
+        return "none"
+    forms = name_forms(content)
+    folded_query = fold_name(query)
+    if any(fold_name(form) == folded_query for form in forms):
+        return "exact"
+    name_tokens: list[str] = []
+    for form in forms:
+        name_tokens.extend(_name_tokens(form))
+    if not name_tokens:
+        return "none"
+    matched = [
+        token
+        for token in query_tokens
+        if any(_token_match(token, candidate) for candidate in name_tokens)
+    ]
+    if len(matched) == len(query_tokens):
+        return "all"
+    if len(query_tokens) >= 3 and len(query_tokens) - len(matched) == 1:
+        longest = max(len(token) for token in query_tokens)
+        if all(token in matched for token in query_tokens if len(token) == longest):
+            return "fallback"
+    return "none"
+
+
 def name_score(query: str, content: Mapping[str, object]) -> float:
     """Score how well ``query`` names this record. 1.0 is exact, 0 is none.
 
-    Token and fuzzy matches stay at or above ``NAME_ACCEPT`` so they sort
-    ahead of semantic hits. A query with no usable name token scores 0.
+    Full-name equality outranks every token matching, which outranks a
+    one-token miss. Strict matches stay at or above ``NAME_ACCEPT``.
     """
 
-    query_tokens = _query_tokens(query)
-    if not query_tokens:
-        return 0.0
-    folded_query = " ".join(query_tokens)
-    best = 0.0
-    for form in name_forms(content):
-        folded = fold_name(form)
-        if not folded:
-            continue
-        if folded == folded_query or folded == fold_name(query):
-            return 1.0
-        name_tokens = [
-            token for token in folded.split() if token not in _TITLES and token not in _STOP
-        ]
-        if not name_tokens:
-            continue
-        if all(token in name_tokens for token in query_tokens):
-            best = max(best, 0.95)
-            continue
-        exact = [token for token in query_tokens if token in name_tokens and len(token) >= 4]
-        if exact:
-            coverage = len(exact) / len(query_tokens)
-            best = max(best, 0.84 + 0.08 * coverage)
-            continue
-        fuzzy = [
-            token
-            for token in query_tokens
-            if any(_fuzzy_token(token, candidate) for candidate in name_tokens)
-        ]
-        if fuzzy and len(fuzzy) == len(query_tokens):
-            best = max(best, 0.82)
-        elif fuzzy:
-            best = max(best, NAME_ACCEPT)
-    return best
+    return {"exact": 1.0, "all": 0.95, "fallback": 0.85, "none": 0.0}[name_match(query, content)]
 
 
 def lexical_overlap(query: str, text: str) -> float:

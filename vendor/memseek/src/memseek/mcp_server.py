@@ -93,11 +93,21 @@ def _as_mcp_tool(descriptor: Mapping[str, Any]) -> mcp_types.Tool:
     title = descriptor.get("title")
     description = descriptor.get("description")
     output_schema = descriptor.get("output_schema")
+    # Connector clients advertise this object. Merge paging here so a catalog
+    # published before offset existed still shows the fields.
+    advertised = dict(input_schema)
+    text = description if isinstance(description, str) else None
+    if kind == "artifact":
+        from memseek.artifacts import merge_paging_schema, with_paging_hint
+
+        advertised = merge_paging_schema(advertised)
+        if text is not None:
+            text = with_paging_hint(text)
     return mcp_types.Tool(
         name=name,
         title=title if isinstance(title, str) else None,
-        description=description if isinstance(description, str) else None,
-        input_schema=dict(input_schema),
+        description=text,
+        input_schema=advertised,
         # Every Memseek route returns a JSON object. Newer APIs publish a more
         # descriptive schema; the object fallback keeps rolling upgrades with
         # an older API conformant while still validating structured results.

@@ -173,43 +173,75 @@ def artifact_catalog_payload(catalog: DefinitionCatalog) -> dict[str, Any]:
     return {"artifacts": artifacts}
 
 
-def _paging_parameter(name: str) -> Any:
-    from memseek.definitions.models import ParameterDefinition
+def paging_property(name: str) -> dict[str, Any]:
+    """JSON Schema for one continuation argument.
+
+    ``minimum`` stays an integer. A float ``0.0`` is what the parameter model
+    emits, and some connector clients then drop the property.
+    """
 
     if name == "offset":
         description = (
-            "Continue every block from this next_offset unless that block's own "
-            "*_offset was set."
+            "Continue from a block's next_offset. Applies to every block that "
+            "was not given its own *_offset."
         )
     else:
         block = name.removesuffix("_offset")
-        description = f"Continue the {block} block from blocks.{block}.next_offset."
-    return ParameterDefinition(
-        type="integer",
-        required=False,
-        default=0,
-        minimum=0,
-        description=description,
-    )
+        description = (
+            f"Continue the {block} block. Set this to blocks.{block}.next_offset "
+            "when that block's has_more is true."
+        )
+    return {"type": "integer", "minimum": 0, "default": 0, "description": description}
+
+
+def paging_parameter_names() -> tuple[str, ...]:
+    return ("offset", *_BLOCK_OFFSET_PARAMETERS.values())
+
+
+def merge_paging_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Add offset and each *_offset to a tool schema. Catalog params stay."""
+
+    merged = dict(schema)
+    properties = dict(merged.get("properties") or {})
+    for name in paging_parameter_names():
+        properties.setdefault(name, paging_property(name))
+    merged["properties"] = properties
+    merged.setdefault("type", "object")
+    return merged
 
 
 def paging_parameters() -> dict[str, Any]:
     """offset plus the block continuation names, even on a catalog published earlier."""
 
-    names = ("offset", *_BLOCK_OFFSET_PARAMETERS.values())
-    return {name: _paging_parameter(name) for name in names}
+    from memseek.definitions.models import ParameterDefinition
+
+    return {
+        name: ParameterDefinition(type="integer", required=False, default=0, minimum=0)
+        for name in paging_parameter_names()
+    }
 
 
 def artifact_parameter_schema(parameters: Mapping[str, Any]) -> dict[str, Any]:
     """Catalog parameters plus the continuation offsets callers page with."""
 
-    from memseek.definitions.models import parameter_json_schema, parameters_json_schema
+    from memseek.definitions.models import parameters_json_schema
 
-    schema = parameters_json_schema(parameters)
-    properties = schema.setdefault("properties", {})
-    for name, parameter in paging_parameters().items():
-        properties.setdefault(name, parameter_json_schema(parameter))
-    return schema
+    return merge_paging_schema(parameters_json_schema(parameters))
+
+
+PAGING_HINT = (
+    " If a block has has_more, call again with offset set to that block's "
+    "next_offset. hard_offset, soft_offset, context_offset, people_offset, "
+    "style_offset, and extended_offset continue a single block."
+)
+
+
+def with_paging_hint(description: str) -> str:
+    """Tell the agent how to turn next_offset into the next call."""
+
+    if "next_offset" in description:
+        return description
+    return description.rstrip() + PAGING_HINT
 
 
 def resolve_artifact_parameters(

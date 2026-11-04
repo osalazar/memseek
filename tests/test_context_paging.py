@@ -43,6 +43,42 @@ def _pref(index: int) -> dict:
     }
 
 
+class AdvertisedContextSchema(unittest.TestCase):
+    def test_tool_schema_exposes_offset_without_catalog_params(self):
+        from memseek.artifacts import artifact_parameter_schema
+        from memseek.mcp_server import _as_mcp_tool
+
+        schema = artifact_parameter_schema({})
+        for name in (
+            "offset",
+            "hard_offset",
+            "soft_offset",
+            "context_offset",
+            "people_offset",
+            "style_offset",
+            "extended_offset",
+        ):
+            field = schema["properties"][name]
+            self.assertEqual(field["type"], "integer")
+            self.assertEqual(field["minimum"], 0)
+            self.assertIsInstance(field["minimum"], int)
+        tool = _as_mcp_tool(
+            {
+                "name": "context",
+                "kind": "artifact",
+                "description": "Bounded context for one action.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"owner": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            }
+        )
+        self.assertIn("offset", tool.input_schema["properties"])
+        self.assertIn("context_offset", tool.input_schema["properties"])
+        self.assertIn("next_offset", tool.description or "")
+
+
 class ContextOffsetPaging(unittest.TestCase):
     def test_http_and_mcp_offset_returns_page_two(self):
         if not os.environ.get("DATABASE_URL"):
@@ -126,6 +162,7 @@ class ContextOffsetPaging(unittest.TestCase):
                         "extended_offset",
                     ):
                         self.assertIn(name, properties)
+                    self.assertIn("next_offset", context.description or "")
                     for name in ("hard_rules", "preferences", "people"):
                         schema = next(tool.input_schema for tool in tools if tool.name == name)
                         self.assertIn("offset", schema["properties"], name)

@@ -254,6 +254,9 @@ def _tool_payload(
         reference = declaration.artifact
         assert reference is not None  # Guaranteed by McpToolDefinition validation.
         artifact = catalog.resolve_artifact(reference)
+        from memseek.artifacts import with_paging_hint
+
+        payload["description"] = with_paging_hint(payload["description"])
         payload.update(
             {
                 "binding": {

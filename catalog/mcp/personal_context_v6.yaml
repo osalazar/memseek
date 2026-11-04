@@ -26,9 +26,12 @@ instructions: 'One owner''s workspace. Before each action, call context with its
   Acknowledged storage is not a ready profile. Friendship suggestions are tentative
   inferences, not confirmed facts or permissions. Use friendship_suggestions when asked
   to infer or review friendship. Only direct owner confirmation can establish closeness;
-  do not infer it from work frequency. people matches exact, fuzzy, and alias names
-  (accents ignored) and returns nothing when nobody matches. Unreviewed archivist-file
-  candidates are not owner-reviewed and are not in people results.'
+  do not infer it from work frequency.   people matches exact, fuzzy, and alias names
+  (accents ignored) and returns nothing when nobody matches. The owner search
+  also returns private archivist-file candidates for that owner. Those hits are unreviewed:
+  reviewed is false, source is archivist-file, and the text is marked (unreviewed).
+  Owner-reviewed people rank above candidates when the match is equally strong.
+  Pass visibility ["shareable"] to hide them. They are not owner-reviewed facts.'
 tools:
 - name: context
   kind: artifact
@@ -70,10 +73,12 @@ tools:
 - name: people
   kind: view
   view: relevant_people@2
-  description: Search owner-reviewed people by exact, fuzzy, or alias name. Accents
-    are ignored and name matches rank above semantic matches. A miss returns no one.
-    Private visibility is the owner's default; pass ["shareable"] for outward use.
-    Unreviewed candidates are not confirmed.
+  description: Search the owner's people by exact, fuzzy, or alias name, including
+    private unreviewed archivist-file candidates. Accents are ignored and name matches
+    rank above semantic matches. Owner-reviewed people rank above candidates on an
+    equal match. A miss returns no one. Candidates are marked reviewed false, source
+    archivist-file, and (unreviewed). Pass ["shareable"] for outward use; that scope
+    does not receive them.
 - name: friendship_suggestions
   kind: view
   view: friendship_suggestions@1

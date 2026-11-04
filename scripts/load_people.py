@@ -158,7 +158,7 @@ def _record(
     raw: str,
 ) -> dict:
     lines = [
-        "UNREVIEWED CANDIDATE from archivist-file; not owner-reviewed.",
+        "(unreviewed) UNREVIEWED CANDIDATE from archivist-file; not owner-reviewed.",
         f"Name: {name}",
     ]
     if aliases:
@@ -184,6 +184,8 @@ def _record(
         "source_line": line_no,
         "source_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
         "biography_source_claim": "archivist-file",
+        "reviewed": False,
+        "source": "archivist-file",
     }
     canonical = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     dedupe = "archivist:" + hashlib.sha256(f"{key}\n{canonical}".encode("utf-8")).hexdigest()
@@ -251,6 +253,7 @@ def load(path: Path, *, owner: str, dry_run: bool, batch_size: int, pause: float
         {
             "entity": owner,
             "collection": "people",
+            "collection_version": 2,
             "type": "context",
             "key": person["key"],
             "text": person["text"],

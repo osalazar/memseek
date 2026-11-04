@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from memseek.artifacts import continue_block
 from memseek.search.names import fold_name, name_score
-from memseek.search.recall_rank import select_context, select_people, select_rules
+from memseek.search.recall_rank import label_unreviewed_text, select_context, select_people, select_rules
 
 import backfill_embeddings
 import load_people
@@ -214,6 +214,43 @@ class PeopleNames(unittest.TestCase):
         )
         self.assertEqual(shareable.ids, ("shareable",))
 
+    def test_archivist_candidates_are_found_and_rank_below_reviewed(self):
+        reviewed = person(
+            "reviewed-barba",
+            "Name: Elizabeth Barba Orozco\nRole: physician",
+            seq=2,
+            similarity=0.4,
+        )
+        reviewed["content"]["reviewed"] = True
+        candidate = person(
+            "file-barba",
+            "Name: Elizabeth Barba Orozco\nRole: physician",
+            activation="candidate",
+            seq=9,
+            similarity=0.4,
+        )
+        candidate["content"]["reviewed"] = False
+        candidate["content"]["source"] = "archivist-file"
+        other_candidate = person(
+            "guess",
+            "Name: Elizabeth Barba\nUNCONFIRMED_MARKER",
+            activation="candidate",
+            seq=3,
+        )
+        rows = [reviewed, candidate, other_candidate]
+        page = select_people(
+            rows, query="Dra. Barba", now=1, visibility={"private", "shareable"}, offset=0, limit=6
+        )
+        self.assertEqual(page.ids, ("reviewed-barba", "file-barba"))
+        self.assertNotIn("guess", page.ids)
+        self.assertIn("(unreviewed)", label_unreviewed_text(candidate["content"]).casefold())
+
+        hidden = select_people(
+            rows, query="Dra. Barba", now=1, visibility={"shareable"}, offset=0, limit=6
+        )
+        self.assertNotIn("file-barba", hidden.ids)
+        self.assertNotIn("reviewed-barba", hidden.ids)
+
     def test_name_match_ranks_above_a_stronger_semantic_hit(self):
         rows = [
             person("semantic", "Name: Marcos Peña\nRole: catalogs", similarity=0.95),
@@ -292,7 +329,10 @@ class PeopleLoader(unittest.TestCase):
         self.assertEqual(first["activation"], "candidate")
         self.assertEqual(first["visibility"], "private")
         self.assertEqual(first["biography_source_claim"], "archivist-file")
+        self.assertEqual(first["source"], "archivist-file")
+        self.assertIs(first["reviewed"], False)
         self.assertNotIn("review_id", first)
+        self.assertIn("(unreviewed)", people[0]["text"].casefold())
         self.assertIn("UNREVIEWED CANDIDATE", people[0]["text"])
         self.assertIn("not owner-reviewed", people[0]["text"])
         self.assertIn("Alcívar", people[1]["text"])

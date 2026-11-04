@@ -217,6 +217,69 @@ def select_context(
     return _page(ordered, offset, limit, ())
 
 
+def _owner_reviewed(content: Mapping[str, Any]) -> bool:
+    """Owner-reviewed people outrank archivist candidates when the match ties.
+
+    A missing ``reviewed`` flag follows activation: confirmed is reviewed, and
+    an archivist candidate is stored with ``reviewed: false``.
+    """
+
+    reviewed = content.get("reviewed")
+    if reviewed is True:
+        return True
+    if reviewed is False:
+        return False
+    return content.get("activation") == "confirmed"
+
+
+def _searchable_person(content: Mapping[str, Any], now: int, visibility: set[str]) -> bool:
+    """Owner-visible people: confirmed rows, plus private archivist candidates.
+
+    Other candidates stay hidden. Shareable scope never includes a private
+    candidate, and a row still has to clear the caller's visibility list.
+    """
+
+    if content.get("tombstone") is True:
+        return False
+    if not _visibility_ok(content, visibility):
+        return False
+    until = content.get("valid_until")
+    if not (isinstance(until, int) and not isinstance(until, bool) and until > now):
+        return False
+    activation = content.get("activation")
+    if activation == "confirmed":
+        return True
+    return activation == "candidate" and content.get("source") == "archivist-file"
+
+
+def label_unreviewed_text(content: Mapping[str, Any]) -> str:
+    """Text as rendered. Archivist candidates always carry an ``(unreviewed)`` marker."""
+
+    text = str(content.get("text") or "")
+    if content.get("source") == "archivist-file" and "(unreviewed)" not in text.casefold():
+        return "(unreviewed) " + text
+    return text
+
+
+def label_unreviewed_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Copy rows so rendered people text shows the unreviewed marker."""
+
+    labelled: list[dict[str, Any]] = []
+    for row in rows:
+        content = row.get("content")
+        if not isinstance(content, dict):
+            labelled.append(dict(row))
+            continue
+        text = label_unreviewed_text(content)
+        if text == content.get("text"):
+            labelled.append(dict(row))
+            continue
+        copied = dict(row)
+        copied["content"] = {**content, "text": text}
+        labelled.append(copied)
+    return labelled
+
+
 def select_people(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -226,19 +289,20 @@ def select_people(
     offset: int,
     limit: int,
 ) -> RecallPage:
-    """Confirmed people, name hits first, nothing when nothing matches.
+    """Owner people, including unreviewed archivist candidates.
 
     Exact, alias, and fuzzy accent-folded name matches sort above semantic
-    and keyword matches. A query that names nobody and does not clear the
-    semantic or keyword bar returns an empty page.
+    and keyword matches. On equal match strength an owner-reviewed person
+    ranks above a candidate. A query that names nobody and does not clear
+    the semantic or keyword bar returns an empty page. Shareable scope and
+    other entities never receive a private candidate.
     """
 
     visible = [
         row
         for row in rows
         if row.get("collection") == "people"
-        and _confirmed(row.get("content") or {}, now)
-        and _visibility_ok(row.get("content") or {}, visibility)
+        and _searchable_person(row.get("content") or {}, now, visibility)
     ]
     scored: list[tuple[Mapping[str, Any], float]] = []
     for row in visible:
@@ -251,6 +315,7 @@ def select_people(
             -(1 if item[1] >= NAME_ACCEPT else 0),
             -item[1],
             -relevance(item[0], query),
+            -(1 if _owner_reviewed(item[0].get("content") or {}) else 0),
             -_seq(item[0]),
             str(item[0]["id"]),
         )

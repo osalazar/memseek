@@ -81,8 +81,9 @@ What the publish changes for stored rows:
 * New views `relevant_rules@1`, `relevant_context@2`, and `relevant_people@2`,
   artifact `interaction_context@5`, and MCP `personal_context@6`. The MCP
   `context` tool now renders `@5`.
-* People records are not given new fields. Candidates from the loader use
-  columns the 0.4.0 schema already allowed.
+* `people@2` adds optional `reviewed` and `source` fields. `people@1` is
+  unchanged, so the 22 confirmed people stay on version 1. The loader writes
+  candidates to `people@2`.
 
 ## 4. Backfill
 
@@ -127,13 +128,15 @@ python3 scripts/load_people.py ./people.txt --owner <entity> --batch-size 20 --p
 ```
 
 Dry-run prints counts and does not call the API. A second run of the same
-file reports duplicates rather than a second current person. Rows are
-`activation=candidate`, `visibility=private`,
-`biography_source_claim=archivist-file`, and the text says they are
-unreviewed. They do not appear in `people` search until the owner confirms
-them. The pause keeps the required people embedding from landing all 2,300
-rows on the worker at once. After the load, re-run the backfill if any
-candidate is still missing a vector.
+file reports duplicates rather than a second current person. Rows are written
+to `people@2` as `activation=candidate`, `visibility=private`,
+`reviewed=false`, `source=archivist-file`, and the text starts with
+`(unreviewed)`. The owner's own `people` search returns those matches.
+Owner-reviewed people rank above them when the match is equally strong. A
+shareable-scope call, or a call for another entity, does not receive them,
+and a query that matches nobody returns nobody. The pause keeps the required
+people embedding from landing all 2,300 rows on the worker at once. After
+the load, re-run the backfill if any candidate is still missing a vector.
 
 ## 6. Verification
 
@@ -170,7 +173,11 @@ curl -s -H "Authorization: Bearer $MEMSEEK_API_KEY" \
 Shareable scope still hides private notes. The same body with
 `"visibility":["shareable"]` must not contain a private life note.
 
-People: `Alcivar` returns the Alcívar record when it is confirmed, and a
+People: the owner's search returns an archivist candidate such as
+`Cristian Alcívar` or `Dra. Barba`. The hit has `reviewed: false`,
+`source: archivist-file`, and `(unreviewed)` in the rendered text. A
+confirmed person with the same match ranks above that candidate. The same
+query with `"visibility":["shareable"]` does not return the candidate. A
 nonsense query returns `"hits": []`.
 
 ```bash
@@ -187,13 +194,16 @@ select count(*)
 from record
 where workspace = 'personal'
   and collection = 'people'
+  and collection_version = 2
   and content->>'activation' = 'candidate'
-  and content->>'biography_source_claim' = 'archivist-file'
-  and content->>'visibility' = 'private';
+  and content->>'source' = 'archivist-file'
+  and content->>'reviewed' = 'false'
+  and content->>'visibility' = 'private'
+  and content->>'text' ilike '%(unreviewed)%';
 ```
 
-That count matches the loader's `inserted + duplicates` after a re-run, and
-none of those rows have `activation = confirmed`.
+That count matches the loader's `inserted + duplicates` after a re-run.
+None of those rows are `activation = confirmed`.
 
 Installed package:
 
@@ -224,10 +234,23 @@ python3 scripts/publish_catalog.py \
 ```
 
 That is `POST /catalog` with `package` `personal_context@0.4.0` and `files`
-set to those 32 YAML documents. The people schema is unchanged, so candidate
-rows remain readable. Embeddings already written stay in `record.embedding`;
-the 0.4.0 views simply do not use rule vectors. Optional: cancel a live
-backfill with `POST /backfill/<id>/cancel`.
+set to those 32 YAML documents. `people@1` is unchanged, so confirmed people
+stay readable. `people@2` exists only in 0.5.0. Delete the archivist
+candidates before the re-post, or the publish reports that the incoming
+catalog has no `people@2` for those rows:
+
+```sql
+delete from record
+where workspace = 'personal'
+  and collection = 'people'
+  and collection_version = 2
+  and content->>'source' = 'archivist-file';
+```
+
+Embeddings on the deleted rows go with them (`record_embedding` is
+`on delete cascade`). Embeddings already written on rules stay in
+`record.embedding`; the 0.4.0 views simply do not use rule vectors.
+Optional: cancel a live backfill with `POST /backfill/<id>/cancel`.
 
 **Then the code.** Check out the baseline commit on `live-2026-10-24` (the
 root commit whose tree is the live `/app` snapshot) and deploy both services

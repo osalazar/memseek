@@ -10,6 +10,7 @@ collections:
 - style_batches@1
 - style_profiles@1
 - people@1
+- people@2
 - people_reviews@1
 - friendship_suggestions@1
 - relationship_sources@1

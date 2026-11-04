@@ -556,6 +556,9 @@ async def resolve_artifact_blocks(
             continue
 
         cap_left = settings.max_artifact_input_records - len(seen)
+        from memseek.search.recall_rank import label_unreviewed_rows
+
+        rows = label_unreviewed_rows(rows)
         selected, lines, block_truncated = _pack_block(
             rows,
             catalog=catalog,

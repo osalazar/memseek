@@ -13,7 +13,7 @@ from typing import Any
 from memseek.config import Settings
 from memseek.db import DatabasePool
 from memseek.definitions import DefinitionCatalog
-from memseek.search.recall_rank import select_context, select_people, select_rules
+from memseek.search.recall_rank import label_unreviewed_text, select_context, select_people, select_rules
 
 _TARGETS = {
     "rules": ("preferences",),
@@ -95,14 +95,29 @@ async def execute_recall(
         page = select_context(
             rows, query=query, now=now, visibility=visibility, offset=offset, limit=limit
         )
-    hits = [{"id": item} for item in page.ids]
+    by_id = {str(row["id"]): row for row in rows}
+    hits = []
+    rendered_lines: list[str] = []
+    for item in page.ids:
+        row = by_id.get(item) or {}
+        content = row.get("content") if isinstance(row.get("content"), dict) else {}
+        hit: dict[str, Any] = {"id": item}
+        if target == "people":
+            hit["fields"] = {
+                "activation": content.get("activation"),
+                "reviewed": content.get("reviewed", content.get("activation") == "confirmed"),
+                "source": content.get("source"),
+                "visibility": content.get("visibility"),
+            }
+            rendered_lines.append(label_unreviewed_text(content))
+        hits.append(hit)
     return {
         "view": {"name": view.name, "version": view.version, "hash": view.definition_hash},
         "parameters": parameters,
         "hits": hits,
         "input_record_ids": list(page.ids),
         "ranking": {"kind": "recall", "scored": True, "target": target},
-        "rendered": None,
+        "rendered": "\n".join(rendered_lines) if rendered_lines else None,
         "rendered_truncated": False,
         "truncated": page.has_more,
         "count": len(hits),

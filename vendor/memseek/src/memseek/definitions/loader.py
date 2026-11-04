@@ -3614,10 +3614,15 @@ class _CatalogBuilder:
             if view.kind == "recall":
                 assert view.recall is not None
                 rendered_recall = self._render_static(view.recall, view.parameters)
-                names = tuple((rendered_recall.get("scope") or {}).get("collections") or ())
-                collections = tuple(
-                    self.collections[(name, self.active_collections[name])] for name in names
-                )
+                scope = rendered_recall.get("scope") or {}
+                names = tuple(scope.get("collections") or ())
+                pinned = scope.get("collection_versions") or {}
+                resolved_recall = []
+                for name in names:
+                    versions = pinned.get(name) or (self.active_collections[name],)
+                    for version in versions:
+                        resolved_recall.append(self.collections[(name, int(version))])
+                collections = tuple(resolved_recall)
             elif view.kind in {"graph", "graph_orphans"}:
                 assert view.graph is not None
                 names = (

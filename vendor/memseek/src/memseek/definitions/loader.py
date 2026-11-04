@@ -2010,6 +2010,9 @@ class _CatalogBuilder:
         if definition.kind == "graph_orphans":
             self._validate_graph_orphans_view(definition, path)
             return
+        if definition.kind == "recall":
+            self._validate_recall_view(definition, path)
+            return
 
         assert definition.query is not None
         allowed = set(definition.parameters)
@@ -2029,6 +2032,47 @@ class _CatalogBuilder:
                 path=f"query.{_path_from_pydantic(error)}",
             ) from exc
         self._validate_search_spec(spec, path, "query", definition.required_capabilities)
+
+    def _validate_recall_view(self, definition: ViewDefinition, path: Path) -> None:
+        """A recall view names a target and the collections it may read."""
+
+        assert definition.recall is not None
+        allowed = set(definition.parameters)
+        try:
+            require_known_references(definition.recall, allowed, context="view recall")
+        except TemplateError as exc:
+            raise DefinitionError(
+                exc.code, str(exc), file=path, path=exc.path or "recall"
+            ) from exc
+        rendered = self._render_static(definition.recall, definition.parameters)
+        if not isinstance(rendered, dict):
+            raise DefinitionError("recall", "recall must be an object", file=path, path="recall")
+        target = rendered.get("target")
+        if target not in {"rules", "context", "people"}:
+            raise DefinitionError(
+                "recall",
+                "recall.target must be rules, context, or people",
+                file=path,
+                path="recall.target",
+            )
+        scope = rendered.get("scope") or {}
+        collections = scope.get("collections") if isinstance(scope, dict) else None
+        if not isinstance(collections, list) or not collections:
+            raise DefinitionError(
+                "recall",
+                "recall.scope.collections is required",
+                file=path,
+                path="recall.scope.collections",
+            )
+        known = {name for name, _version in self.collections}
+        unknown = [name for name in collections if name not in known]
+        if unknown:
+            raise DefinitionError(
+                "reference",
+                f"recall view references unknown collections: {unknown}",
+                file=path,
+                path="recall.scope.collections",
+            )
 
     def _validate_graph_view(self, definition: ViewDefinition, path: Path) -> None:
         """Keep graph views explicit rather than accepting ad-hoc traversal YAML."""
@@ -3567,7 +3611,14 @@ class _CatalogBuilder:
 
         for key in view_keys:
             view = self.views[key]
-            if view.kind in {"graph", "graph_orphans"}:
+            if view.kind == "recall":
+                assert view.recall is not None
+                rendered_recall = self._render_static(view.recall, view.parameters)
+                names = tuple((rendered_recall.get("scope") or {}).get("collections") or ())
+                collections = tuple(
+                    self.collections[(name, self.active_collections[name])] for name in names
+                )
+            elif view.kind in {"graph", "graph_orphans"}:
                 assert view.graph is not None
                 names = (
                     (view.graph.edges,)

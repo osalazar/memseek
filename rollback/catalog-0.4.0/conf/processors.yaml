@@ -1,0 +1,31 @@
+processors:
+- name: embedding_v1
+  kind: embedding
+  input:
+    collections:
+    - life_context
+- name: importance
+  kind: score
+  source: constant
+  value: 5
+  scale:
+  - 1
+  - 10
+  input:
+    collections:
+    - observations
+    - preferences
+    - life_context
+    - interactions
+    - interaction_frames
+    - context_snapshots
+- name: embedding_people
+  kind: embedding
+  input:
+    collections:
+    - people
+- name: embedding_extended
+  kind: embedding
+  input:
+    collections:
+    - extended_context

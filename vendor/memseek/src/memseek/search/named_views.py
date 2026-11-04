@@ -63,6 +63,7 @@ def _view_collections(view: ViewDefinition, catalog: DefinitionCatalog) -> list[
                 walk(item)
 
     walk(view.query)
+    walk(getattr(view, "recall", None))
     return sorted(names & {name for name, _ in catalog.collections})
 
 
@@ -161,6 +162,25 @@ async def execute_view(
         paging = (limit, offset, snapshot)
     resolved_parameters = resolve_view_parameters(view, parameters)
     view_metadata = {"name": view.name, "version": view.version, "hash": view.definition_hash}
+    if view.kind == "recall":
+        from memseek.search.recall import execute_recall
+
+        assert view.recall is not None
+        try:
+            rendered_recall = render_object(view.recall, resolved_parameters)
+        except TemplateError as exc:
+            raise SearchRequestError("view_parameter", str(exc)) from exc
+        if not isinstance(rendered_recall, dict):
+            raise SearchRequestError("recall_target", "recall view did not render an object")
+        return await execute_recall(
+            pool,
+            workspace=workspace,
+            view=view,
+            parameters=resolved_parameters,
+            rendered=rendered_recall,
+            catalog=catalog,
+            settings=settings,
+        )
     if view.kind == "graph":
         from memseek.graph import GraphTraversalError, GraphTraversalRequest, traverse_graph
 

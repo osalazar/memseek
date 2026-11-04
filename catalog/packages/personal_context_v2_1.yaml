@@ -12,6 +12,7 @@ collections:
 processors:
 - importance
 - embedding_v1
+- embedding_rules
 - maintain_preferences
 - maintain_context
 - classify_interaction

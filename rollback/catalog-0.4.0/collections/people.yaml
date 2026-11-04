@@ -1,0 +1,97 @@
+collections:
+- name: people
+  version: 1
+  active: true
+  mode: keyed
+  schema:
+    type: object
+    required:
+    - text
+    - kind
+    - activation
+    - visibility
+    - valid_until
+    properties:
+      text:
+        type: string
+        minLength: 1
+        maxLength: 4000
+      kind:
+        type: string
+        enum:
+        - relationship
+        - situation
+        - commitment
+        - procedure
+        - fact
+      activation:
+        type: string
+        enum:
+        - confirmed
+        - candidate
+      visibility:
+        type: string
+        enum:
+        - private
+        - shareable
+      valid_until:
+        type: integer
+        minimum: 0
+      tombstone:
+        type: boolean
+      review_id:
+        type: string
+      source_line:
+        type: integer
+      source_sha256:
+        type: string
+      biography_source_claim:
+        type: string
+    additionalProperties: false
+  fields:
+    kind:
+      path: content.kind
+      type: string
+      filter: true
+      project: true
+    activation:
+      path: content.activation
+      type: string
+      filter: true
+      project: true
+    visibility:
+      path: content.visibility
+      type: string
+      filter: true
+      project: true
+    valid_until:
+      path: content.valid_until
+      type: integer
+      filter: true
+      project: true
+  required_processors:
+  - embedding_people
+  search_profile: pg_default
+- name: people_reviews
+  version: 1
+  active: true
+  mode: keyed
+  schema:
+    type: object
+    required:
+    - text
+    - authority
+    - source
+    properties:
+      text:
+        type: string
+      authority:
+        type: string
+        enum:
+        - owner
+      source:
+        type: string
+    additionalProperties: false
+  fields: {}
+  required_processors: []
+  search_profile: pg_default

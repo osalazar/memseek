@@ -1,0 +1,48 @@
+name: personal_context
+version: 0.5.0
+collections:
+- observations@1
+- preferences@1
+- life_context@1
+- interactions@1
+- interaction_frames@1
+- context_snapshots@1
+- style_batches@1
+- style_profiles@1
+- people@1
+- people_reviews@1
+- friendship_suggestions@1
+- relationship_sources@1
+- extended_context@1
+processors:
+- importance
+- embedding_v1
+- embedding_rules
+- maintain_preferences
+- maintain_context
+- classify_interaction
+- maintain_style
+- embedding_people
+- embedding_extended
+triggers:
+- maintain_preferences.default
+- maintain_context.default
+- maintain_style.default
+views:
+- hard_rules@1
+- applicable_preferences@1
+- preference_audit@1
+- relevant_context@1
+- relevant_context@2
+- relevant_rules@1
+- applicable_style@1
+- style_audit@1
+- relevant_people@1
+- relevant_people@2
+- friendship_suggestions@1
+- extended_context@1
+artifacts:
+- interaction_context@5
+mcp: personal_context@6
+search_profiles:
+- pg_default

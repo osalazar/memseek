@@ -1,0 +1,51 @@
+views:
+- name: applicable_style
+  version: 1
+  active: true
+  parameters: &id001
+    style_entities:
+      type: string_array
+      required: false
+      default:
+      - __no_style__
+      min_items: 1
+      max_items: 2
+      description: Trusted harness computes these with style_entities_for_frame(owner, frame). Never guess
+        or select by semantic similarity. Omit if language/scope is unknown or the action is not communication.
+  query:
+    mode: structured
+    scope: &id002
+      entities: '{{style_entities}}'
+      collections:
+      - style_profiles
+      types:
+      - style
+      status: active
+      versions: current
+    where:
+      activation:
+        eq: learned
+    k: 2
+    order_by: &id003
+    - field: activation
+      direction: asc
+    include: &id004
+    - text
+    - key
+    - entity
+    fields: &id005
+    - activation
+    render: true
+- name: style_audit
+  version: 1
+  active: true
+  parameters: *id001
+  query:
+    mode: structured
+    scope: *id002
+    where: {}
+    k: 2
+    order_by: *id003
+    include: *id004
+    fields: *id005
+    render: true

@@ -1199,6 +1199,8 @@ def _view_collections(definition: ViewDefinition) -> tuple[str, ...]:
         names.extend(name for name in (definition.graph.edges, definition.graph.nodes) if name)
     if definition.query is not None:
         names.extend(_scoped_collections(definition.query))
+    if definition.recall is not None:
+        names.extend(_scoped_collections(definition.recall))
     seen: dict[str, None] = {}
     for name in names:
         # A template reference is not a collection name; the loader has already

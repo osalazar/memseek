@@ -4,6 +4,11 @@ processors:
   input:
     collections:
     - life_context
+- name: embedding_rules
+  kind: embedding
+  input:
+    collections:
+    - preferences
 - name: importance
   kind: score
   source: constant

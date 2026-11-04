@@ -1,0 +1,52 @@
+views:
+- name: relevant_people
+  version: 1
+  active: true
+  parameters:
+    owner:
+      type: string
+      required: true
+    now:
+      type: integer
+      required: true
+      minimum: 0
+    task:
+      type: string
+      required: true
+    visibility:
+      type: string_array
+      required: false
+      item_enum:
+      - private
+      - shareable
+      default:
+      - shareable
+      min_items: 1
+  query:
+    q: '{{task}}'
+    mode: hybrid
+    scope:
+      entities:
+      - '{{owner}}'
+      collections:
+      - people
+      types:
+      - context
+      status: active
+      versions: current
+    where:
+      activation:
+        eq: confirmed
+      visibility:
+        in: '{{visibility}}'
+      valid_until:
+        gt: '{{now}}'
+    k: 6
+    include:
+    - text
+    - key
+    fields:
+    - kind
+    - visibility
+    - valid_until
+    render: true

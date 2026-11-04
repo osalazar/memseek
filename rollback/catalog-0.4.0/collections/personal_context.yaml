@@ -1,0 +1,330 @@
+collections:
+- name: observations
+  version: 1
+  active: true
+  mode: event
+  schema:
+    type: object
+    required:
+    - text
+    - authority
+    - source
+    properties:
+      text:
+        type: string
+        minLength: 1
+        maxLength: 12000
+      authority:
+        type: string
+        enum:
+        - owner
+        - external
+        - assistant
+        - tool
+      source:
+        type: string
+        minLength: 1
+        maxLength: 200
+      tombstone:
+        type: boolean
+    additionalProperties: false
+  fields: {}
+  required_processors: []
+  search_profile: pg_default
+- name: preferences
+  version: 1
+  active: true
+  mode: keyed
+  schema:
+    type: object
+    required:
+    - text
+    - activation
+    - strength
+    - priority
+    - actions
+    - channels
+    - audiences
+    - recipients
+    - domains
+    - valid_until
+    properties:
+      text:
+        type: string
+        minLength: 1
+        maxLength: 450
+      activation:
+        type: string
+        enum:
+        - confirmed
+        - candidate
+      strength:
+        type: string
+        enum:
+        - hard
+        - soft
+      priority:
+        type: integer
+        minimum: 0
+        maximum: 100
+      actions: &id001
+        type: array
+        items:
+          type: string
+          minLength: 1
+          maxLength: 80
+        minItems: 1
+        maxItems: 8
+        uniqueItems: true
+      channels: &id002
+        type: array
+        items:
+          type: string
+          minLength: 1
+          maxLength: 80
+        minItems: 1
+        maxItems: 8
+        uniqueItems: true
+      audiences: &id003
+        type: array
+        items:
+          type: string
+          minLength: 1
+          maxLength: 80
+        minItems: 1
+        maxItems: 8
+        uniqueItems: true
+      recipients: &id004
+        type: array
+        items:
+          type: string
+          minLength: 1
+          maxLength: 80
+        minItems: 1
+        maxItems: 8
+        uniqueItems: true
+      domains: &id005
+        type: array
+        items:
+          type: string
+          minLength: 1
+          maxLength: 80
+        minItems: 1
+        maxItems: 8
+        uniqueItems: true
+      valid_until:
+        type: integer
+        minimum: 0
+      tombstone:
+        type: boolean
+    additionalProperties: false
+  fields:
+    activation:
+      path: content.activation
+      type: string
+      filter: true
+      project: true
+    strength:
+      path: content.strength
+      type: string
+      filter: true
+      project: true
+    priority:
+      path: content.priority
+      type: integer
+      filter: true
+      project: true
+      sort: true
+    actions:
+      path: content.actions
+      type:
+      - string
+      filter: true
+      project: true
+    channels:
+      path: content.channels
+      type:
+      - string
+      filter: true
+      project: true
+    audiences:
+      path: content.audiences
+      type:
+      - string
+      filter: true
+      project: true
+    recipients:
+      path: content.recipients
+      type:
+      - string
+      filter: true
+      project: true
+    domains:
+      path: content.domains
+      type:
+      - string
+      filter: true
+      project: true
+    valid_until:
+      path: content.valid_until
+      type: integer
+      filter: true
+      project: true
+  required_processors: []
+  search_profile: pg_default
+- name: life_context
+  version: 1
+  active: true
+  mode: keyed
+  schema:
+    type: object
+    required:
+    - text
+    - kind
+    - activation
+    - visibility
+    - valid_until
+    properties:
+      text:
+        type: string
+        minLength: 1
+        maxLength: 450
+      kind:
+        type: string
+        enum:
+        - relationship
+        - situation
+        - commitment
+        - procedure
+        - fact
+      activation:
+        type: string
+        enum:
+        - confirmed
+        - candidate
+      visibility:
+        type: string
+        enum:
+        - private
+        - shareable
+      valid_until:
+        type: integer
+        minimum: 0
+      tombstone:
+        type: boolean
+    additionalProperties: false
+  fields:
+    kind:
+      path: content.kind
+      type: string
+      filter: true
+      project: true
+    activation:
+      path: content.activation
+      type: string
+      filter: true
+      project: true
+    visibility:
+      path: content.visibility
+      type: string
+      filter: true
+      project: true
+    valid_until:
+      path: content.valid_until
+      type: integer
+      filter: true
+      project: true
+  required_processors:
+  - embedding_v1
+  search_profile: pg_default
+- name: interactions
+  version: 1
+  active: true
+  mode: event
+  schema:
+    type: object
+    required:
+    - text
+    properties:
+      text:
+        type: string
+        minLength: 1
+        maxLength: 12000
+      tombstone:
+        type: boolean
+    additionalProperties: false
+  fields: {}
+  required_processors: []
+  search_profile: pg_default
+- name: interaction_frames
+  version: 1
+  active: true
+  mode: keyed
+  schema:
+    type: object
+    required:
+    - text
+    - frames
+    properties:
+      text:
+        type: string
+        minLength: 1
+        maxLength: 450
+      frames:
+        type: array
+        items:
+          type: object
+          required:
+          - task
+          - actions
+          - channels
+          - audiences
+          - recipients
+          - domains
+          - needs_context
+          properties:
+            task:
+              type: string
+              minLength: 1
+              maxLength: 1500
+            actions: *id001
+            channels: *id002
+            audiences: *id003
+            recipients: *id004
+            domains: *id005
+            needs_context:
+              type: array
+              items:
+                type: string
+                enum:
+                - action
+                - channel
+                - audience
+                - recipient
+                - domain
+                - split_request
+              maxItems: 8
+          additionalProperties: false
+        minItems: 1
+        maxItems: 5
+      tombstone:
+        type: boolean
+    additionalProperties: false
+  fields: {}
+  required_processors: []
+  search_profile: pg_default
+- name: context_snapshots
+  version: 1
+  active: true
+  mode: keyed
+  schema:
+    type: object
+    properties:
+      text:
+        type: string
+    required:
+    - text
+    additionalProperties: true
+  fields: {}
+  required_processors: []
+  search_profile: pg_default

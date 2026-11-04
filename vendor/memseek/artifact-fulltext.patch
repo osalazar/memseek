@@ -1,0 +1,13 @@
+--- a/src/memseek/artifacts.py
++++ b/src/memseek/artifacts.py
+@@ -300,7 +300,9 @@
+         if is_new and used_new >= input_cap_left:
+             truncated = True
+             break
+-        line = render_record(_renderable(row), profile="compact", catalog=catalog)
++        # Artifact blocks are executable context, so pack complete record text.
++        # The compact profile is a search preview and silently clips the middle.
++        line = render_record(_renderable(row), profile="derivation_input", catalog=catalog)
+         candidate = [*lines, line]
+         if _tokens(render_rows(candidate, fence=None)) > max_tokens:
+             truncated = True

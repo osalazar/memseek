@@ -1,0 +1,132 @@
+collections:
+- name: style_batches
+  version: 1
+  active: true
+  mode: event
+  schema:
+    type: object
+    required:
+    - text
+    - scope
+    - samples
+    properties:
+      text:
+        type: string
+        minLength: 1
+        maxLength: 100
+      scope:
+        type: object
+        required:
+        - channel
+        - audience
+        - domain
+        - recipient
+        - language
+        properties:
+          channel:
+            type: string
+            minLength: 1
+            maxLength: 80
+          audience:
+            type: string
+            minLength: 1
+            maxLength: 80
+          domain:
+            type: string
+            minLength: 1
+            maxLength: 80
+          recipient:
+            type: string
+            minLength: 1
+            maxLength: 80
+          language:
+            type: string
+            minLength: 1
+            maxLength: 80
+        additionalProperties: false
+      samples:
+        type: array
+        items:
+          type: object
+          required:
+          - event_id
+          - text
+          - timestamp
+          - source
+          - authority
+          - origin
+          properties:
+            event_id:
+              type: string
+              minLength: 1
+              maxLength: 200
+            text:
+              type: string
+              minLength: 1
+              maxLength: 2000
+            timestamp:
+              type: string
+              minLength: 1
+              maxLength: 40
+            source:
+              type: string
+              minLength: 1
+              maxLength: 200
+            authority:
+              const: owner
+            origin:
+              type: string
+              enum:
+              - authored
+              - owner_edit
+          additionalProperties: false
+        minItems: 1
+        maxItems: 48
+    additionalProperties: false
+  fields: {}
+  required_processors: []
+  search_profile: pg_default
+- name: style_profiles
+  version: 1
+  active: true
+  mode: keyed
+  schema:
+    type: object
+    required:
+    - text
+    - activation
+    - basis
+    - evidence_ids
+    properties:
+      text:
+        type: string
+        minLength: 1
+        maxLength: 900
+      activation:
+        type: string
+        enum:
+        - learned
+        - candidate
+      basis:
+        type: string
+        minLength: 1
+        maxLength: 300
+      evidence_ids:
+        type: array
+        items:
+          type: string
+          minLength: 1
+          maxLength: 200
+        minItems: 1
+        maxItems: 12
+        uniqueItems: true
+    additionalProperties: false
+  fields:
+    activation:
+      path: content.activation
+      type: string
+      filter: true
+      project: true
+      sort: true
+  required_processors: []
+  search_profile: pg_default

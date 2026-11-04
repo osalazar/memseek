@@ -1,0 +1,44 @@
+views:
+- name: friendship_suggestions
+  version: 1
+  active: true
+  parameters:
+    owner:
+      type: string
+      required: true
+    visibility:
+      type: string_array
+      required: false
+      item_enum:
+      - private
+      - shareable
+      default:
+      - shareable
+      min_items: 1
+  query:
+    mode: structured
+    scope:
+      entities:
+      - '{{owner}}'
+      collections:
+      - friendship_suggestions
+      types:
+      - suggestion
+      status: active
+      versions: current
+    where:
+      activation:
+        eq: candidate
+      visibility:
+        in: '{{visibility}}'
+    order_by:
+    - field: source_line
+      direction: asc
+    k: 64
+    include:
+    - text
+    - key
+    fields:
+    - activation
+    - visibility
+    render: true

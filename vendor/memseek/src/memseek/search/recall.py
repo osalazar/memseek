@@ -8,12 +8,22 @@ instead of failing the whole context read.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from memseek.config import Settings
 from memseek.db import DatabasePool
 from memseek.definitions import DefinitionCatalog
-from memseek.search.recall_rank import label_unreviewed_text, select_context, select_people, select_rules
+from memseek.logging import log_event
+from memseek.search.recall_rank import (
+    label_unreviewed_text,
+    people_debug,
+    select_context,
+    select_people,
+    select_rules,
+)
+
+LOGGER = logging.getLogger("memseek.search.recall")
 
 _TARGETS = {
     "rules": ("preferences",),
@@ -111,7 +121,7 @@ async def execute_recall(
             }
             rendered_lines.append(label_unreviewed_text(content))
         hits.append(hit)
-    return {
+    result = {
         "view": {"name": view.name, "version": view.version, "hash": view.definition_hash},
         "parameters": parameters,
         "hits": hits,
@@ -133,6 +143,21 @@ async def execute_recall(
             "visibility": sorted(visibility) if target != "rules" else None,
         },
     }
+    if target == "people" and recall_debug_enabled(settings, visibility):
+        report = people_debug(rows, query=query, now=now, visibility=visibility)
+        log_event(LOGGER, "info", "recall.people_scores", **report)
+        result["recall"]["debug"] = report
+    return result
+
+
+def recall_debug_enabled(settings: Settings, visibility: set[str]) -> bool:
+    """Owner-only score dump. Off unless ``RECALL_DEBUG`` is set.
+
+    Shareable scope is what other agents are allowed to see, so the cosine
+    list stays out of that response even when the flag is on.
+    """
+
+    return bool(getattr(settings, "recall_debug", False)) and "private" in visibility
 
 
 async def _load_rows(

@@ -155,6 +155,12 @@ into the container. A terminal is refused, so an interactive `railway ssh`
 does not hang. Omit the path, or pass `-`, for the same stdin read. A line
 with fewer than three `|` fields is a prose note: it is counted and skipped.
 
+People score debug is off. Set `RECALL_DEBUG=true` on the api and restart it
+to log the top cosines for an owner people search and to attach them on
+`recall.debug`. A shareable-only call does not receive that list. Unreviewed
+archivist candidates match on the name only. A reviewed vector hit needs
+cosine at least 0.90, above the corpus mean, and a gap over the next cosine.
+
 Dry-run prints counts and does not call the API. A second run of the same
 file reports duplicates rather than a second current person. Rows are written
 to `people@2` as `activation=candidate`, `visibility=private`,

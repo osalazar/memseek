@@ -18,7 +18,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "vendor" / "memseek" / "src"))
 
-from memseek.search.recall_rank import PEOPLE_COSINE_MIN, PEOPLE_PAGE, select_people
+from memseek.search.recall_rank import (
+    PEOPLE_PAGE,
+    PEOPLE_VECTOR_MIN,
+    people_debug,
+    select_people,
+)
 
 FOREVER = 253402300799
 _DIM = 256
@@ -116,7 +121,7 @@ class RealisticPeopleSearch(unittest.TestCase):
         stranger = max(row["similarity"] for row in (
             _row("x", name, embed_like_small("zzzz-not-a-person")) for name in self.names[:40]
         ))
-        self.assertLess(stranger, PEOPLE_COSINE_MIN)
+        self.assertLess(stranger, PEOPLE_VECTOR_MIN)
 
     def test_barba_and_alcivar_are_short_name_lists(self):
         barba = self._search("Barba")
@@ -137,7 +142,7 @@ class RealisticPeopleSearch(unittest.TestCase):
         query_vector = embed_like_small(query)
         text = "(unreviewed)\nName: Cristian Alcivar Conde\nRole: neighbor\nReach: HOLE"
         similarity = _cosine(query_vector, embed_like_small(text))
-        self.assertGreaterEqual(similarity, PEOPLE_COSINE_MIN)
+        self.assertGreaterEqual(similarity, PEOPLE_VECTOR_MIN)
         extras = []
         for index in range(7):
             extras.append(
@@ -174,3 +179,90 @@ class RealisticPeopleSearch(unittest.TestCase):
         )
         self.assertEqual(len(rest.ids), 2)
         self.assertFalse(rest.has_more)
+
+
+def _reviewed(identity: str, name: str, similarity: float) -> dict:
+    return {
+        "id": identity,
+        "seq": 1,
+        "collection": "people",
+        "similarity": similarity,
+        "text_match": 0.0,
+        "content": {
+            "text": f"Name: {name}\nRole: neighbor",
+            "name": name,
+            "activation": "confirmed",
+            "visibility": "private",
+            "reviewed": True,
+            "kind": "relationship",
+            "valid_until": FOREVER,
+        },
+    }
+
+
+def _candidate(identity: str, name: str, similarity: float) -> dict:
+    row = _reviewed(identity, name, similarity)
+    row["content"] = {
+        **row["content"],
+        "activation": "candidate",
+        "source": "archivist-file",
+        "reviewed": False,
+    }
+    return row
+
+
+class HubVectors(unittest.TestCase):
+    def test_nonsense_returns_nobody_when_hubs_score_high(self):
+        rows = [
+            _candidate("chloe", "Chloe Axmith Hernández", 0.99),
+            _candidate("carlos", "Carlos Gallardo Piqué", 0.98),
+            _candidate("txus", "Txus Fernández", 0.97),
+            _candidate("rick", "Rick Halden", 0.96),
+            _candidate("julien", "Julien Steinhauser", 0.95),
+        ]
+        for index, similarity in enumerate((0.94, 0.93, 0.92, 0.91, 0.90, 0.89)):
+            rows.append(_reviewed(f"hub-{index}", f"Ada Lovelace {index}", similarity))
+        for index in range(40):
+            rows.append(_reviewed(f"norm-{index}", f"Norma Calderon {index}", 0.35))
+        page = select_people(
+            rows,
+            query="zzzz-not-a-person",
+            now=1,
+            visibility={"private"},
+            offset=0,
+            limit=100,
+        )
+        self.assertEqual(page.total, 0)
+        self.assertEqual(page.ids, ())
+        report = people_debug(
+            rows, query="zzzz-not-a-person", now=1, visibility={"private"}
+        )
+        self.assertGreaterEqual(report["top"][0]["similarity"], 0.90)
+        self.assertFalse(any(item["kept"] for item in report["top"]))
+        self.assertIn(report["top"][0]["reason"], {"rejected-unreviewed", "rejected-gap", "rejected-margin"})
+
+    def test_a_reviewed_vector_hit_must_stand_away_from_the_corpus(self):
+        rows = [_reviewed("match", "Someone Else", 0.96)]
+        for index in range(30):
+            rows.append(_reviewed(f"n{index}", f"Norma Calderon {index}", 0.32))
+        page = select_people(
+            rows,
+            query="paraphrase with no shared name",
+            now=1,
+            visibility={"private"},
+            offset=0,
+            limit=5,
+        )
+        self.assertEqual(page.ids, ("match",))
+
+        alone = _candidate("chloe", "Chloe Axmith Hernández", 0.99)
+        crowded = [alone, *[_reviewed(f"n{i}", f"Norma Calderon {i}", 0.30) for i in range(30)]]
+        missed = select_people(
+            crowded,
+            query="zzzz-not-a-person",
+            now=1,
+            visibility={"private"},
+            offset=0,
+            limit=5,
+        )
+        self.assertEqual(missed.ids, ())

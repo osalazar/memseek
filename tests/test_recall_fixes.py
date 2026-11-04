@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from memseek.artifacts import continue_block
 from memseek.search.names import fold_name, name_score
+from memseek.search.recall import recall_debug_enabled
 from memseek.search.recall_rank import label_unreviewed_text, select_context, select_people, select_rules
 
 import backfill_embeddings
@@ -260,6 +261,15 @@ class PeopleNames(unittest.TestCase):
             rows, query="Barba", now=1, visibility={"private"}, offset=0, limit=6
         )
         self.assertEqual(page.ids[0], "named")
+
+    def test_recall_debug_is_owner_only_and_off_by_default(self):
+        class _Settings:
+            recall_debug = False
+
+        self.assertFalse(recall_debug_enabled(_Settings(), {"private", "shareable"}))
+        _Settings.recall_debug = True
+        self.assertTrue(recall_debug_enabled(_Settings(), {"private"}))
+        self.assertFalse(recall_debug_enabled(_Settings(), {"shareable"}))
 
 
 class Paging(unittest.TestCase):

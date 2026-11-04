@@ -6,20 +6,27 @@ SQL retrieval only supplies rows; it does not decide who outranks whom.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from memseek.search.names import NAME_ACCEPT, lexical_overlap, name_score
+from memseek.search.names import NAME_ACCEPT, lexical_overlap, name_forms, name_score
 
 # Cosine similarity on text-embedding-3-small. Below this, a vector neighbor
 # is not evidence the row is about the task. Keyword and name hits do not
-# need to clear it.
+# need to clear it. People search does not use this floor: hub vectors clear
+# it, and a higher bar, against queries that do not name them.
 SEMANTIC_ACCEPT = 0.28
-# People search uses a higher bar. Short name embeddings share a cone, so a
-# nonsense query still clears 0.28 for hundreds of candidates. Only a
-# near-paraphrase is allowed in on cosine alone.
-PEOPLE_COSINE_MIN = 0.82
+# Reviewed people may match on cosine only above this, and only when the hit
+# also stands clear of the rest of the corpus. Unreviewed candidates never
+# match on cosine alone.
+PEOPLE_VECTOR_MIN = 0.90
+# Absolute gap over the mean cosine of the visible people for this query.
+PEOPLE_VECTOR_MARGIN = 0.15
+# Gap over the next-best cosine. A pack of hub vectors sits together at the
+# top and fails this, so none of them are returned.
+PEOPLE_VECTOR_GAP = 0.08
 PEOPLE_PAGE = 5
 # Always included, ahead of task matches: the highest-priority hard rules.
 CORE_SIZE = 12
@@ -285,22 +292,79 @@ def label_unreviewed_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, A
     return labelled
 
 
-def _people_kept(row: Mapping[str, Any], query: str) -> tuple[bool, float]:
-    """Every people hit clears a minimum score. Weak vector neighbors do not.
+def _visible_people(
+    rows: Sequence[Mapping[str, Any]], *, now: int, visibility: set[str]
+) -> list[Mapping[str, Any]]:
+    return [
+        row
+        for row in rows
+        if row.get("collection") == "people"
+        and _searchable_person(row.get("content") or {}, now, visibility)
+    ]
 
-    A strong name (exact, fuzzy, or alias, accents folded) is enough. A
-    vector-only or similarity-only hit must clear ``PEOPLE_COSINE_MIN``.
-    Keyword overlap in the biography is not a people match.
+
+def _similarity(row: Mapping[str, Any]) -> float | None:
+    raw = row.get("similarity")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return float(raw)
+
+
+def _corpus_similarity(rows: Sequence[Mapping[str, Any]]) -> tuple[float, float]:
+    """Mean and population standard deviation of cosines for this query."""
+
+    values = [value for row in rows if (value := _similarity(row)) is not None]
+    if not values:
+        return 0.0, 0.0
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return mean, math.sqrt(variance)
+
+
+def _next_similarity(rows: Sequence[Mapping[str, Any]], row_id: str) -> float | None:
+    """Highest cosine in the corpus other than ``row_id``."""
+
+    best: float | None = None
+    for row in rows:
+        if str(row.get("id")) == row_id:
+            continue
+        value = _similarity(row)
+        if value is None:
+            continue
+        if best is None or value > best:
+            best = value
+    return best
+
+
+def _people_reason(
+    row: Mapping[str, Any],
+    query: str,
+    *,
+    mean: float,
+    others: float | None,
+) -> tuple[bool, float, str]:
+    """Why a visible person is kept or dropped.
+
+    Unreviewed archivist candidates need a lexical name match. A reviewed
+    vector-only hit needs cosine at least ``PEOPLE_VECTOR_MIN``, a margin
+    over the corpus mean, and a gap over the next cosine so a hub cluster
+    is dropped together.
     """
 
     content = row.get("content") or {}
     named = name_score(query, content)
-    similarity = _number(row.get("similarity"))
     if named >= NAME_ACCEPT:
-        return True, named
-    if similarity >= PEOPLE_COSINE_MIN:
-        return True, named
-    return False, named
+        return True, named, "lexical"
+    if not _owner_reviewed(content):
+        return False, named, "rejected-unreviewed"
+    similarity = _similarity(row)
+    if similarity is None or similarity < PEOPLE_VECTOR_MIN:
+        return False, named, "rejected-vector"
+    if similarity < mean + PEOPLE_VECTOR_MARGIN:
+        return False, named, "rejected-margin"
+    if others is not None and similarity - others < PEOPLE_VECTOR_GAP:
+        return False, named, "rejected-gap"
+    return True, named, "vector"
 
 
 def select_people(
@@ -314,23 +378,21 @@ def select_people(
 ) -> RecallPage:
     """Owner people, including unreviewed archivist candidates.
 
-    Exact, alias, and fuzzy accent-folded name matches sort above semantic
+    Exact, alias, and fuzzy accent-folded name matches sort above vector
     hits. On equal match strength an owner-reviewed person ranks above a
-    candidate. Vector-only neighbors must clear a high cosine gate, so a
-    nonsense query returns nobody. The page is at most ``PEOPLE_PAGE`` hits;
-    ``offset`` walks the rest. Shareable scope and other entities never
-    receive a private candidate.
+    candidate. Unreviewed candidates match on the name only. A reviewed
+    vector hit must clear 0.90 and stand away from the corpus, so hub
+    vectors and a nonsense query return nobody. The page is at most
+    ``PEOPLE_PAGE`` hits; ``offset`` walks the rest.
     """
 
-    visible = [
-        row
-        for row in rows
-        if row.get("collection") == "people"
-        and _searchable_person(row.get("content") or {}, now, visibility)
-    ]
+    visible = _visible_people(rows, now=now, visibility=visibility)
+    mean, _stdev = _corpus_similarity(visible)
     scored: list[tuple[Mapping[str, Any], float]] = []
     for row in visible:
-        keep, named = _people_kept(row, query)
+        keep, named, _reason = _people_reason(
+            row, query, mean=mean, others=_next_similarity(visible, str(row.get("id")))
+        )
         if keep:
             scored.append((row, named))
     scored.sort(
@@ -345,3 +407,56 @@ def select_people(
     )
     page_limit = min(limit, PEOPLE_PAGE) if limit else PEOPLE_PAGE
     return _page([row for row, _score in scored], offset, page_limit, ())
+
+
+def people_debug(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    query: str,
+    now: int,
+    visibility: set[str],
+    top: int = 8,
+) -> dict[str, Any]:
+    """Top people cosines for an owner debug check. No biography text."""
+
+    visible = _visible_people(rows, now=now, visibility=visibility)
+    mean, stdev = _corpus_similarity(visible)
+    explained: list[dict[str, Any]] = []
+    for row in visible:
+        content = row.get("content") or {}
+        forms = name_forms(content)
+        keep, named, reason = _people_reason(
+            row, query, mean=mean, others=_next_similarity(visible, str(row.get("id")))
+        )
+        similarity = _similarity(row)
+        z_score = None
+        if similarity is not None and stdev > 1e-9:
+            z_score = round((similarity - mean) / stdev, 3)
+        explained.append(
+            {
+                "id": str(row.get("id")),
+                "name": (forms[0] if forms else "")[:80],
+                "similarity": None if similarity is None else round(similarity, 4),
+                "z": z_score,
+                "name_score": round(named, 4),
+                "reviewed": _owner_reviewed(content),
+                "kept": keep,
+                "reason": reason,
+            }
+        )
+    explained.sort(
+        key=lambda item: (
+            -(item["similarity"] if isinstance(item["similarity"], float) else -1.0),
+            item["id"],
+        )
+    )
+    return {
+        "query": query[:120],
+        "count": len(visible),
+        "mean": round(mean, 4),
+        "stdev": round(stdev, 4),
+        "vector_min": PEOPLE_VECTOR_MIN,
+        "margin": PEOPLE_VECTOR_MARGIN,
+        "gap": PEOPLE_VECTOR_GAP,
+        "top": explained[:top],
+    }

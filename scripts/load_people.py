@@ -228,12 +228,11 @@ def _post(url: str, key: str, records: list[dict]) -> dict:
         raise SystemExit(f"POST /records failed ({exc.code}): {detail}") from exc
 
 
-def load(path: Path, *, owner: str, dry_run: bool, batch_size: int, pause: float, url: str) -> dict:
-    people, notes = parse_people(path.read_text(encoding="utf-8"))
-    summary = {
+def _summary(people: list[dict], notes: list[str], *, owner: str, source: str, dry_run: bool) -> dict:
+    return {
         "dry_run": dry_run,
         "owner": owner,
-        "source": str(path),
+        "source": source,
         "parsed": len(people),
         "skipped_or_header": len(notes),
         "activation": "candidate",
@@ -241,15 +240,13 @@ def load(path: Path, *, owner: str, dry_run: bool, batch_size: int, pause: float
         "source_claim": "archivist-file",
         "reviewed": False,
         "keys": [person["key"] for person in people],
+        "inserted": 0,
+        "duplicates": 0,
     }
-    if dry_run:
-        summary["inserted"] = 0
-        summary["duplicates"] = 0
-        return summary
-    key = _api_key()
-    inserted = 0
-    duplicates = 0
-    bodies = [
+
+
+def record_bodies(people: list[dict], owner: str) -> list[dict]:
+    return [
         {
             "entity": owner,
             "collection": "people",
@@ -262,6 +259,26 @@ def load(path: Path, *, owner: str, dry_run: bool, batch_size: int, pause: float
         }
         for person in people
     ]
+
+
+def load_text(
+    text: str,
+    *,
+    owner: str,
+    source: str,
+    dry_run: bool,
+    batch_size: int,
+    pause: float,
+    url: str,
+) -> dict:
+    people, notes = parse_people(text)
+    summary = _summary(people, notes, owner=owner, source=source, dry_run=dry_run)
+    if dry_run:
+        return summary
+    key = _api_key()
+    inserted = 0
+    duplicates = 0
+    bodies = record_bodies(people, owner)
     for start in range(0, len(bodies), batch_size):
         chunk = bodies[start : start + batch_size]
         result = _post(url, key, chunk)
@@ -274,11 +291,104 @@ def load(path: Path, *, owner: str, dry_run: bool, batch_size: int, pause: float
     return summary
 
 
+def load(path: Path, *, owner: str, dry_run: bool, batch_size: int, pause: float, url: str) -> dict:
+    return load_text(
+        path.read_text(encoding="utf-8"),
+        owner=owner,
+        source=str(path),
+        dry_run=dry_run,
+        batch_size=batch_size,
+        pause=pause,
+        url=url,
+    )
+
+
+def load_direct(
+    text: str,
+    *,
+    workspace: str,
+    owner: str,
+    source: str,
+    dry_run: bool,
+    batch_size: int,
+    pause: float,
+) -> dict:
+    """Write candidates through the database. Dry-run never opens it.
+
+    The text is the people file itself. Callers streaming over ssh pass stdin
+    and this function does not create a file.
+    """
+
+    import asyncio
+
+    people, notes = parse_people(text)
+    summary = _summary(people, notes, owner=owner, source=source, dry_run=dry_run)
+    if dry_run:
+        return summary
+
+    from direct_runtime import prepare_engine, workspace_name
+
+    prepare_engine()
+    name = workspace_name(workspace)
+    bodies = record_bodies(people, owner)
+
+    async def run() -> tuple[int, int]:
+        from memseek.config import Settings
+        from memseek.db import pool_lifespan
+        from memseek.definitions import load_definition_catalog
+        from memseek.records import PublicRecordInput, RecordBatchRequest, insert_public_records
+        from memseek.workspace_catalog import WorkspaceCatalogRegistry
+
+        settings = Settings()
+        inserted = 0
+        duplicates = 0
+        async with pool_lifespan(settings) as pool:
+            registry = WorkspaceCatalogRegistry(pool, settings, load_definition_catalog(settings))
+            catalog = await registry.get(name)
+            for start in range(0, len(bodies), batch_size):
+                chunk = bodies[start : start + batch_size]
+                request = RecordBatchRequest(
+                    records=tuple(PublicRecordInput.model_validate(body) for body in chunk)
+                )
+                result = await insert_public_records(
+                    pool,
+                    workspace=name,
+                    request=request,
+                    catalog=catalog,
+                    settings=settings,
+                )
+                inserted += len(result.inserted)
+                duplicates += len(result.duplicates)
+                if start + batch_size < len(bodies) and pause:
+                    await asyncio.sleep(pause)
+        return inserted, duplicates
+
+    inserted, duplicates = asyncio.run(run())
+    summary["inserted"] = inserted
+    summary["duplicates"] = duplicates
+    return summary
+
+
+def read_source(path: str | None) -> tuple[str, str]:
+    """Return ``(text, label)``. ``-`` or an omitted path reads stdin and writes no file."""
+
+    if path in (None, "-"):
+        return sys.stdin.read(), "stdin"
+    return Path(path).read_text(encoding="utf-8"), path
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("path", type=Path, help="people file, one person per line")
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="people file, or - / omit to read stdin (never written to disk)",
+    )
     parser.add_argument("--owner", required=True, help="entity the candidates belong to")
-    parser.add_argument("--dry-run", action="store_true", help="parse and report; do not call the API")
+    parser.add_argument("--dry-run", action="store_true", help="parse and report; do not write")
+    parser.add_argument("--direct", action="store_true", help="use DATABASE_URL, no API key")
+    parser.add_argument("--workspace", default=os.environ.get("MEMSEEK_WORKSPACE", "personal"))
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--pause", type=float, default=3.0, help="seconds between batches, so the worker is not flooded")
     parser.add_argument("--url", default=os.environ.get("MEMSEEK_URL", "http://127.0.0.1:8000"))
@@ -287,14 +397,27 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--batch-size must be from 1 to 100")
     if args.pause < 0:
         parser.error("--pause must be >= 0")
-    summary = load(
-        args.path,
-        owner=args.owner,
-        dry_run=args.dry_run,
-        batch_size=args.batch_size,
-        pause=args.pause,
-        url=args.url,
-    )
+    text, source = read_source(args.path)
+    if args.direct:
+        summary = load_direct(
+            text,
+            workspace=args.workspace,
+            owner=args.owner,
+            source=source,
+            dry_run=args.dry_run,
+            batch_size=args.batch_size,
+            pause=args.pause,
+        )
+    else:
+        summary = load_text(
+            text,
+            owner=args.owner,
+            source=source,
+            dry_run=args.dry_run,
+            batch_size=args.batch_size,
+            pause=args.pause,
+            url=args.url,
+        )
     print(json.dumps({key: value for key, value in summary.items() if key != "keys"}, indent=2))
     print(f"keys: {len(summary['keys'])}", file=sys.stderr)
     return 0

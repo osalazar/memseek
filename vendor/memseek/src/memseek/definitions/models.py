@@ -750,9 +750,17 @@ class ViewDefinition(VersionedDefinition):
     graph: GraphProjection | None = None
     # Recall views rank a small always-on core plus task matches, or people by
     # name. The mapping is templated like a search query and executed by
-    # memseek.search.recall instead of SearchSpec.
+    # memseek.search.recall instead of SearchSpec. Absent on every older view,
+    # and omitted from serialization then, so a stored catalog hash is unchanged.
     recall: dict[str, Any] | None = None
     required_capabilities: tuple[Literal["vector", "text", "recent", "structured"], ...] = ()
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        dumped = dict(handler(self))
+        if dumped.get("recall") is None:
+            dumped.pop("recall", None)
+        return dumped
 
     @model_validator(mode="after")
     def validate_capabilities(self) -> ViewDefinition:

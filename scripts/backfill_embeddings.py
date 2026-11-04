@@ -42,7 +42,8 @@ from pathlib import Path
 USD_PER_MILLION = 0.02
 DEFAULT_TARGETS = (
     ("preferences", 1, "embedding_rules", 543, 80),
-    ("people", 1, "embedding_people", 2300, 140),
+    ("people", 1, "embedding_people", 22, 140),
+    ("people", 2, "embedding_people", 2300, 140),
 )
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -203,6 +204,145 @@ def _wait(url: str, key: str, backfill_id: str, poll: float) -> dict:
         time.sleep(poll)
 
 
+async def _enqueue(pool, workspace: str, *, collection: str, version: int, processor: str, max_rows: int) -> dict:
+    from memseek.backfill import BackfillError, list_backfills, request_backfill
+    from memseek.definitions import load_definition_catalog
+    from memseek.workspace_catalog import WorkspaceCatalogRegistry
+    from memseek.config import Settings
+
+    settings = Settings()
+    registry = WorkspaceCatalogRegistry(pool, settings, load_definition_catalog(settings))
+    catalog = await registry.get(workspace)
+    try:
+        handle = await request_backfill(
+            pool,
+            workspace=workspace,
+            collection=collection,
+            version=version,
+            processor=processor,
+            catalog=catalog,
+            max_rows=max_rows,
+        )
+    except BackfillError as exc:
+        if exc.code != "backfill_exists":
+            raise SystemExit(f"{exc.code}: {exc.detail}") from exc
+        found = await list_backfills(pool, workspace=workspace)
+        handle = next(
+            (
+                item
+                for item in found
+                if item.collection == collection
+                and item.collection_version == version
+                and item.processor == processor
+                and item.live
+            ),
+            None,
+        )
+        if handle is None:
+            raise SystemExit(exc.detail) from exc
+    return handle.as_json()
+
+
+def enqueue_direct(
+    workspace: str,
+    *,
+    collection: str,
+    version: int,
+    processor: str,
+    max_rows: int,
+) -> dict:
+    """Register one backfill slice through the database. Does not wait."""
+
+    import asyncio
+
+    from direct_runtime import prepare_engine
+
+    prepare_engine()
+
+    async def run() -> dict:
+        from memseek.config import Settings
+        from memseek.db import pool_lifespan
+
+        settings = Settings()
+        async with pool_lifespan(settings) as pool:
+            return await _enqueue(
+                pool,
+                workspace,
+                collection=collection,
+                version=version,
+                processor=processor,
+                max_rows=max_rows,
+            )
+
+    return asyncio.run(run())
+
+
+def run_target_direct(
+    workspace: str,
+    *,
+    collection: str,
+    version: int,
+    processor: str,
+    max_rows: int,
+    pause: float,
+    poll: float,
+) -> dict:
+    """Same gentle slice loop as the HTTP client, using the database."""
+
+    import asyncio
+
+    from direct_runtime import prepare_engine
+
+    prepare_engine()
+
+    async def run() -> dict:
+        from memseek.backfill import get_backfill
+        from memseek.config import Settings
+        from memseek.db import pool_lifespan
+        from uuid import UUID
+
+        settings = Settings()
+        slices = annotated = scanned = 0
+        async with pool_lifespan(settings) as pool:
+            while True:
+                payload = await _enqueue(
+                    pool,
+                    workspace,
+                    collection=collection,
+                    version=version,
+                    processor=processor,
+                    max_rows=max_rows,
+                )
+                backfill_id = UUID(str(payload["id"]))
+                while True:
+                    handle = await get_backfill(pool, workspace=workspace, backfill_id=backfill_id)
+                    if handle.state in {"done", "failed", "cancelled"}:
+                        break
+                    await asyncio.sleep(poll)
+                body = handle.as_json()
+                slices += 1
+                annotated += int(body.get("annotated") or 0)
+                scanned += int(body.get("scanned") or 0)
+                if body.get("state") == "failed":
+                    raise SystemExit(f"backfill {backfill_id} failed: {body.get('last_error')}")
+                if int(body.get("scanned") or 0) == 0 and int(body.get("annotated") or 0) == 0:
+                    break
+                if int(body.get("scanned") or 0) < max_rows:
+                    break
+                if pause:
+                    await asyncio.sleep(pause)
+        return {
+            "collection": collection,
+            "version": version,
+            "processor": processor,
+            "slices": slices,
+            "scanned": scanned,
+            "annotated": annotated,
+        }
+
+    return asyncio.run(run())
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=os.environ.get("MEMSEEK_URL", "http://127.0.0.1:8000"))
@@ -216,6 +356,8 @@ def main(argv: list[str] | None = None) -> int:
         help="collection@version/processor, repeatable. Default: rules then people.",
     )
     parser.add_argument("--estimate-only", action="store_true")
+    parser.add_argument("--direct", action="store_true", help="use DATABASE_URL, no API key")
+    parser.add_argument("--workspace", default=os.environ.get("MEMSEEK_WORKSPACE", "personal"))
     args = parser.parse_args(argv)
     if args.max_rows < 1:
         parser.error("--max-rows must be positive")
@@ -232,6 +374,25 @@ def main(argv: list[str] | None = None) -> int:
     estimate = estimate_cost()
     print(json.dumps({"estimate": estimate}, indent=2))
     if args.estimate_only:
+        return 0
+    if args.direct:
+        reports = []
+        for collection, version, processor in targets:
+            print(f"backfill {collection}@{version}/{processor}", file=sys.stderr)
+            reports.append(
+                run_target_direct(
+                    args.workspace,
+                    collection=collection,
+                    version=version,
+                    processor=processor,
+                    max_rows=args.max_rows,
+                    pause=args.pause,
+                    poll=args.poll,
+                )
+            )
+            if args.pause:
+                time.sleep(args.pause)
+        print(json.dumps({"backfills": reports}, indent=2))
         return 0
     key = _api_key()
     reports = []

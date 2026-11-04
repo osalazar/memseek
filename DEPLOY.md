@@ -1,38 +1,55 @@
 # Deploy the recall fix
 
-Both Railway services run this tree. The working directory for each command
-is the repository root: the directory that contains `catalog/`, `scripts/`,
-`personal_context/`, and `vendor/memseek/`. That is the live `/app` layout.
-
-Do this from a checkout of `recall-fixes-2026-11-04` after it is merged, or
-from that branch directly. Do not deploy `main`.
+Both Railway services build the `Dockerfile` at this repository root. The
+image workdir is `/app/vendor/memseek` (so `conf/models.yaml` resolves) and
+`PATH` includes that engine's virtualenv. `PYTHONPATH=/app` so
+`personal_context` imports. Do not deploy `main`.
 
 The start commands already configured on the services stay as they are
 (`uvicorn memseek.api:app` for api, `memseek worker` for the worker). This
 change does not add a migration and does not change how API keys or provider
-keys are read.
+keys are read. Publish, backfill, and the people load run inside the api
+container with `--direct`. They use `DATABASE_URL`. They do not need
+`MEMSEEK_API_KEY`.
+
+## 0. Pre-deploy catalog check
+
+Do this before `railway up` switches traffic. It loads the stored
+`personal_context@0.4.0` catalog with the new code (the hash must stay
+`0858fa5c95586ea26a6418ed8f7f9cde22f4f9d5b18799b22b901df5a731a3dc`) and dry-runs
+publishing `0.5.0` on top of the live rows.
+
+From this repository root, with the production `DATABASE_URL`:
+
+```bash
+docker build -t memseek-recall .
+docker run --rm -e DATABASE_URL="$DATABASE_URL" memseek-recall \
+  memseek catalog-check \
+  --workspace personal \
+  --dir /app/catalog \
+  --package personal_context@0.5.0
+```
+
+A clean check prints a report whose `blockers` array is empty and exits 0.
+`stored catalog hash mismatch` means do not deploy.
 
 ## 1. Migration
 
-There is no new migration. The embedding column, the backfill table, and the
-people collection already exist. Confirm the database is at the current head
-before the new code serves traffic:
+There is no new migration. Confirm the database is at the current head before
+the new code serves traffic. Inside the new image, before traffic, or from
+the api container after a check has passed:
 
 ```bash
-cd /path/to/this/repo
-# uses DATABASE_URL from the environment, the same way the services do
-python -m memseek migrate
+docker run --rm -e DATABASE_URL="$DATABASE_URL" memseek-recall memseek migrate
 ```
 
-If `memseek` is not on `PATH` inside the service image, the equivalent is the
-command the services already use to migrate at boot. Order is: migrate (a
-no-op when the head matches), then deploy api and worker together, then
-publish the catalog, then backfill. Do not backfill before the catalog that
-defines `embedding_rules` is installed.
+Order: this migrate (a no-op when the head matches), the catalog-check above,
+then deploy api and worker together, then publish the catalog, then backfill.
+Do not backfill before `embedding_rules` is installed.
 
 ## 2. Deploy api and worker
 
-From this repository root, so both services receive the same tree:
+From this repository root, so both services build the same Dockerfile:
 
 ```bash
 railway up -s api
@@ -44,33 +61,31 @@ A mixed pair will disagree about the catalog the worker is enriching.
 
 ## 3. Catalog
 
-`personal_context@0.5.0` is the package in `catalog/`. Publishing sends every
-YAML file under the directory. Dry-run compiles and plans, and writes nothing.
+`personal_context@0.5.0` is the package in `/app/catalog`. Run this on the api
+service. `--direct` reads `DATABASE_URL` and does not use an API key.
+`--dry-run` is `memseek catalog-check`'s plan: it writes nothing.
 
 ```bash
-export MEMSEEK_URL=https://<the-api>
-export MEMSEEK_API_KEY=<the workspace key>   # or MEMSEEK_KEY_FILE
-python3 scripts/publish_catalog.py \
+railway ssh -s api -- python3 /app/scripts/publish_catalog.py \
+  --direct --workspace personal \
   --package personal_context@0.5.0 \
-  --directory catalog \
+  --directory /app/catalog \
   --dry-run
 ```
 
 A clean dry-run has no `blockers`. Then publish:
 
 ```bash
-python3 scripts/publish_catalog.py \
+railway ssh -s api -- python3 /app/scripts/publish_catalog.py \
+  --direct --workspace personal \
   --package personal_context@0.5.0 \
-  --directory catalog
+  --directory /app/catalog
 ```
 
-The HTTP call is `POST /catalog` with:
-
-```json
-{"package": "personal_context@0.5.0", "files": {"<relative path>": "<yaml text>", "...": "..."}}
-```
-
-Dry-run is the same body to `POST /catalog?dry_run=true`.
+The same directory can still be posted over HTTP as
+`POST /catalog` with body
+`{"package": "personal_context@0.5.0", "files": {"<relative path>": "<yaml>"}}`.
+Dry-run is `POST /catalog?dry_run=true`. Prefer `--direct` on the deploy box.
 
 What the publish changes for stored rows:
 
@@ -93,12 +108,17 @@ a 5 second pause. Stop and re-run any time; a row that already has the
 annotation is skipped.
 
 ```bash
-python3 scripts/backfill_embeddings.py --estimate-only
-python3 scripts/backfill_embeddings.py --max-rows 32 --pause 5
+railway ssh -s api -- python3 /app/scripts/backfill_embeddings.py \
+  --direct --workspace personal --estimate-only
+railway ssh -s api -- python3 /app/scripts/backfill_embeddings.py \
+  --direct --workspace personal --max-rows 32 --pause 5
 ```
 
-Default targets are `preferences@1/embedding_rules` and
-`people@1/embedding_people`.
+Default targets are `preferences@1/embedding_rules`, `people@1/embedding_people`
+(the 22 already embedded), and `people@2/embedding_people` (the file import).
+One `memseek backfill --workspace personal --collection preferences --version 1
+--processor embedding_rules --max-rows 32` is a single slice of the same work.
+The script repeats slices and pauses so the worker is not flooded.
 
 Cost, using the published OpenAI price for `text-embedding-3-small` of $0.02
 per 1,000,000 input tokens. Rules are capped at 450 characters (about 80
@@ -106,9 +126,10 @@ tokens). A people line is about 140 tokens.
 
 | Corpus | Rows | Assumed tokens | USD |
 | --- | ---: | ---: | ---: |
-| Rules (`preferences`) | 543 | ~43,000 | ~$0.0009 |
-| People still to embed | 2,300 | ~322,000 | ~$0.0064 |
-| Together |  | ~365,000 | **about $0.008** |
+| Rules (`preferences@1`) | 543 | ~43,000 | ~$0.0009 |
+| Confirmed people (`people@1`, already embedded) | 22 | ~3,000 | skipped |
+| Archivist candidates (`people@2`) | 2,300 | ~322,000 | ~$0.0064 |
+| Together, new vectors |  | ~365,000 | **about $0.008** |
 
 The 22 confirmed people are already embedded and will be skipped. Query
 embeddings when an agent calls `context` are a few hundred tokens per call
@@ -123,9 +144,14 @@ optional lane stays small between slices.
 Run later, from the machine that has the file. The file is not in this repo.
 
 ```bash
-python3 scripts/load_people.py ./people.txt --owner <entity> --dry-run
-python3 scripts/load_people.py ./people.txt --owner <entity> --batch-size 20 --pause 3
+railway ssh -s api -- python3 /app/scripts/load_people.py \
+  --direct --workspace personal --owner <entity> --dry-run < people.txt
+railway ssh -s api -- python3 /app/scripts/load_people.py \
+  --direct --workspace personal --owner <entity> --batch-size 20 --pause 3 < people.txt
 ```
+
+The people file is the process stdin. It is not written into the container.
+Omit the path, or pass `-`, for the same stdin read.
 
 Dry-run prints counts and does not call the API. A second run of the same
 file reports duplicates rather than a second current person. Rows are written
@@ -224,13 +250,15 @@ files stored in `rollback/catalog-0.4.0` (32 YAML files, the live row). Do
 not point this at `catalog/`, which is 0.5.0.
 
 ```bash
-python3 scripts/publish_catalog.py \
+railway ssh -s api -- python3 /app/scripts/publish_catalog.py \
+  --direct --workspace personal \
   --package personal_context@0.4.0 \
-  --directory rollback/catalog-0.4.0 \
+  --directory /app/rollback/catalog-0.4.0 \
   --dry-run
-python3 scripts/publish_catalog.py \
+railway ssh -s api -- python3 /app/scripts/publish_catalog.py \
+  --direct --workspace personal \
   --package personal_context@0.4.0 \
-  --directory rollback/catalog-0.4.0
+  --directory /app/rollback/catalog-0.4.0
 ```
 
 That is `POST /catalog` with `package` `personal_context@0.4.0` and `files`

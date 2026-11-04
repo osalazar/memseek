@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
-"""POST a catalog directory to ``/catalog``.
+"""Publish a catalog directory.
 
-Dry-run (nothing is installed)::
+Over HTTP (needs ``MEMSEEK_API_KEY``)::
 
     python3 scripts/publish_catalog.py --package personal_context@0.5.0 --directory catalog --dry-run
-
-Publish::
-
     python3 scripts/publish_catalog.py --package personal_context@0.5.0 --directory catalog
 
-Roll the catalog back to the attached 0.4.0 row::
+Inside the api container, with no API key (``DATABASE_URL`` is already set)::
 
-    python3 scripts/publish_catalog.py --package personal_context@0.4.0 \\
-        --directory rollback/catalog-0.4.0
+    python3 /app/scripts/publish_catalog.py --direct --workspace personal \\
+        --package personal_context@0.5.0 --directory /app/catalog --dry-run
+    python3 /app/scripts/publish_catalog.py --direct --workspace personal \\
+        --package personal_context@0.5.0 --directory /app/catalog
 
-The request body is ``{"package": "<name@version>", "files": {"<relative path>": "<yaml text>"}}``.
-``--dry-run`` sends it as ``POST /catalog?dry_run=true``, which compiles and
-plans the publish and writes nothing. The API key comes from ``MEMSEEK_API_KEY``
-or ``MEMSEEK_KEY_FILE`` and is never printed.
+``--dry-run`` plans the publish and writes nothing. ``--direct`` calls the same
+install path as ``POST /catalog``. Roll back by pointing ``--directory`` at
+``rollback/catalog-0.4.0`` and ``--package personal_context@0.4.0``.
 """
 
 from __future__ import annotations
@@ -80,15 +78,55 @@ def publish(url: str, key: str, package: str, directory: Path, *, dry_run: bool)
         return exc.code, payload
 
 
+def publish_direct(workspace: str, package: str, directory: Path, *, dry_run: bool) -> dict:
+    """Install or preflight through the engine's database connection."""
+
+    import asyncio
+
+    from direct_runtime import prepare_engine, workspace_name
+
+    directory = directory.resolve()
+    files = catalog_files(directory)
+    prepare_engine()
+
+    async def run() -> dict:
+        from memseek.config import Settings
+        from memseek.db import pool_lifespan
+        from memseek.definitions import load_definition_catalog
+        from memseek.workspace_catalog import WorkspaceCatalogRegistry, WorkspaceCatalogRequest
+
+        settings = Settings()
+        request = WorkspaceCatalogRequest(package=package, files=files)
+        async with pool_lifespan(settings) as pool:
+            registry = WorkspaceCatalogRegistry(pool, settings, load_definition_catalog(settings))
+            if dry_run:
+                report, *_rest = await registry.preflight(workspace_name(workspace), request)
+                return report.as_json()
+            result = await registry.install(workspace_name(workspace), request)
+            return result.as_json()
+
+    return asyncio.run(run())
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", required=True, help="for example personal_context@0.5.0")
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--direct", action="store_true", help="use DATABASE_URL, no API key")
+    parser.add_argument("--workspace", default=os.environ.get("MEMSEEK_WORKSPACE", "personal"))
     parser.add_argument("--url", default=os.environ.get("MEMSEEK_URL", "http://127.0.0.1:8000"))
     args = parser.parse_args(argv)
+    directory = args.directory
+    if not directory.is_absolute():
+        directory = (Path.cwd() / directory).resolve()
+    if args.direct:
+        payload = publish_direct(args.workspace, args.package, directory, dry_run=args.dry_run)
+        print(json.dumps(payload, indent=2))
+        blockers = payload.get("blockers") or []
+        return 0 if not blockers else 1
     status, payload = publish(
-        args.url, _api_key(), args.package, args.directory, dry_run=args.dry_run
+        args.url, _api_key(), args.package, directory, dry_run=args.dry_run
     )
     print(json.dumps(payload, indent=2))
     return 0 if status in {200, 202} else 1

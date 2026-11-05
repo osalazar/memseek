@@ -18,7 +18,7 @@ async def test_people(mem):
         while not (await mem.record(rid))['ready']:
             assert time.monotonic() < deadline
             await asyncio.sleep(.3)
-    frame = {'task': 'Who is Alex, my executive coach?', 'actions': ['research'],
+    frame = {'task': 'Who is Alex?', 'actions': ['research'],
              'channels': ['web'], 'audiences': ['self'], 'recipients': ['none'], 'domains': ['work']}
     kit = PersonalContext(mem, owner)
     internal = await kit.prepare(frame=frame, outward=False, flush=False)

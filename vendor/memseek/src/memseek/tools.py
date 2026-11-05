@@ -13,7 +13,6 @@ from typing import Any
 
 from memseek.config import Settings
 from memseek.definitions import DefinitionCatalog, PackageDefinition, ViewDefinition
-from memseek.definitions.models import parameters_json_schema
 from memseek.search.pagination import paginates, view_input_schema
 
 _JSON_SCHEMA_DRAFT = "https://json-schema.org/draft/2020-12/schema"
@@ -158,9 +157,15 @@ def _invocation_input_schema(kind: str) -> dict[str, Any]:
 
 
 def _parameters_input_schema(parameters: Any) -> dict[str, Any]:
-    """Add the schema dialect marker to a shared parameter object schema."""
+    """Add the schema dialect marker and the continuation offsets.
 
-    return {"$schema": _JSON_SCHEMA_DRAFT, **parameters_json_schema(parameters)}
+    ``offset`` and each block ``*_offset`` are accepted even when the stored
+    artifact was published before those names were declared.
+    """
+
+    from memseek.artifacts import artifact_parameter_schema
+
+    return {"$schema": _JSON_SCHEMA_DRAFT, **artifact_parameter_schema(parameters)}
 
 
 def _object_output_schema(description: str) -> dict[str, Any]:
@@ -225,10 +230,12 @@ def _tool_payload(
         reference = declaration.view
         assert reference is not None  # Guaranteed by McpToolDefinition validation.
         view = catalog.resolve_view(reference)
-        if paginates(view):
-            payload["description"] += (" Enumerate hits using limit/offset/snapshot; continue until has_more=false, "
-                "then verify unique IDs equal total_count. Keep query arguments fixed across pages. "
-                "On page_changed restart. rendered_truncated concerns only rendered text; hits retain full text.")
+        if paginates(view) or declaration.name == "extended_context":
+            payload["description"] += (
+                " Page with limit, offset, and snapshot. When has_more is true, "
+                "call again with offset set to next_offset and the same snapshot. "
+                "A page lists only the hits that fit in the rendered text."
+            )
         payload.update(
             {
                 "binding": {
@@ -249,6 +256,9 @@ def _tool_payload(
         reference = declaration.artifact
         assert reference is not None  # Guaranteed by McpToolDefinition validation.
         artifact = catalog.resolve_artifact(reference)
+        from memseek.artifacts import with_paging_hint
+
+        payload["description"] = with_paging_hint(payload["description"])
         payload.update(
             {
                 "binding": {

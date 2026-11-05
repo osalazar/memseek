@@ -171,6 +171,8 @@ collections:
       filter: true
       project: true
   required_processors: []
+  optional_processors:
+  - embedding_rules
   search_profile: pg_default
 - name: life_context
   version: 1

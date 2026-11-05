@@ -1,0 +1,211 @@
+views:
+- name: hard_rules
+  version: 1
+  active: true
+  parameters:
+    owner: &id001
+      type: string
+      required: true
+    now: &id002
+      type: integer
+      required: true
+      minimum: 0
+  query:
+    mode: structured
+    scope:
+      entities:
+      - '{{owner}}'
+      collections:
+      - preferences
+      types:
+      - preference
+      status: active
+      versions: current
+    order_by:
+    - field: priority
+      direction: desc
+    k: 200
+    include:
+    - text
+    - key
+    fields:
+    - activation
+    - strength
+    - priority
+    - actions
+    - channels
+    - audiences
+    - recipients
+    - domains
+    - valid_until
+    render: true
+    where:
+      strength:
+        eq: hard
+      activation:
+        eq: confirmed
+      valid_until:
+        gt: '{{now}}'
+- name: applicable_preferences
+  version: 1
+  active: true
+  parameters:
+    owner: *id001
+    now: *id002
+    actions:
+      type: string_array
+      required: true
+      min_items: 1
+      max_items: 9
+      description: Include 'any' plus the applicable labels; unknown is not a wildcard.
+    channels:
+      type: string_array
+      required: true
+      min_items: 1
+      max_items: 9
+      description: Include 'any' plus the applicable labels; unknown is not a wildcard.
+    audiences:
+      type: string_array
+      required: true
+      min_items: 1
+      max_items: 9
+      description: Include 'any' plus the applicable labels; unknown is not a wildcard.
+    recipients:
+      type: string_array
+      required: true
+      min_items: 1
+      max_items: 9
+      description: Include 'any' plus the applicable labels; unknown is not a wildcard.
+    domains:
+      type: string_array
+      required: true
+      min_items: 1
+      max_items: 9
+      description: Include 'any' plus the applicable labels; unknown is not a wildcard.
+  query:
+    mode: structured
+    scope:
+      entities:
+      - '{{owner}}'
+      collections:
+      - preferences
+      types:
+      - preference
+      status: active
+      versions: current
+    order_by:
+    - field: priority
+      direction: desc
+    k: 200
+    include:
+    - text
+    - key
+    fields:
+    - activation
+    - strength
+    - priority
+    - actions
+    - channels
+    - audiences
+    - recipients
+    - domains
+    - valid_until
+    render: true
+    where:
+      strength:
+        eq: soft
+      activation:
+        eq: confirmed
+      valid_until:
+        gt: '{{now}}'
+      actions:
+        contains_any: '{{actions}}'
+      channels:
+        contains_any: '{{channels}}'
+      audiences:
+        contains_any: '{{audiences}}'
+      recipients:
+        contains_any: '{{recipients}}'
+      domains:
+        contains_any: '{{domains}}'
+- name: preference_audit
+  version: 1
+  active: true
+  parameters:
+    owner: *id001
+  query:
+    mode: structured
+    scope:
+      entities:
+      - '{{owner}}'
+      collections:
+      - preferences
+      types:
+      - preference
+      status: active
+      versions: current
+    order_by:
+    - field: priority
+      direction: desc
+    k: 200
+    include:
+    - text
+    - key
+    fields:
+    - activation
+    - strength
+    - priority
+    - actions
+    - channels
+    - audiences
+    - recipients
+    - domains
+    - valid_until
+    render: true
+    where: {}
+- name: relevant_context
+  version: 1
+  active: true
+  parameters:
+    owner: *id001
+    now: *id002
+    task:
+      type: string
+      required: true
+    visibility:
+      type: string_array
+      required: false
+      item_enum:
+      - private
+      - shareable
+      default:
+      - shareable
+      min_items: 1
+  query:
+    q: '{{task}}'
+    mode: hybrid
+    scope:
+      entities:
+      - '{{owner}}'
+      collections:
+      - life_context
+      types:
+      - context
+      status: active
+      versions: current
+    where:
+      activation:
+        eq: confirmed
+      visibility:
+        in: '{{visibility}}'
+      valid_until:
+        gt: '{{now}}'
+    k: 6
+    include:
+    - text
+    - key
+    fields:
+    - kind
+    - visibility
+    - valid_until
+    render: true

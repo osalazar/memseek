@@ -744,11 +744,23 @@ class GraphProjection(StrictModel):
 
 
 class ViewDefinition(VersionedDefinition):
-    kind: Literal["search", "graph", "graph_orphans"] = "search"
+    kind: Literal["search", "graph", "graph_orphans", "recall"] = "search"
     parameters: dict[PublicName, ParameterDefinition] = Field(default_factory=dict)
     query: dict[str, Any] | None = None
     graph: GraphProjection | None = None
+    # Recall views rank a small always-on core plus task matches, or people by
+    # name. The mapping is templated like a search query and executed by
+    # memseek.search.recall instead of SearchSpec. Absent on every older view,
+    # and omitted from serialization then, so a stored catalog hash is unchanged.
+    recall: dict[str, Any] | None = None
     required_capabilities: tuple[Literal["vector", "text", "recent", "structured"], ...] = ()
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> dict[str, Any]:
+        dumped = dict(handler(self))
+        if dumped.get("recall") is None:
+            dumped.pop("recall", None)
+        return dumped
 
     @model_validator(mode="after")
     def validate_capabilities(self) -> ViewDefinition:
@@ -758,9 +770,16 @@ class ViewDefinition(VersionedDefinition):
                 raise ValueError("search view requires query")
             if self.graph is not None:
                 raise ValueError("search view forbids graph")
+            if self.recall is not None:
+                raise ValueError("search view forbids recall")
+        if self.kind == "recall":
+            if not self.recall or self.recall.get("target") not in {"rules", "context", "people"}:
+                raise ValueError("recall view requires recall.target of rules, context, or people")
+            if self.query is not None or self.graph is not None:
+                raise ValueError("recall view forbids query and graph")
         if self.kind in {"graph", "graph_orphans"}:
-            if self.query is not None:
-                raise ValueError("graph-derived view forbids query")
+            if self.query is not None or self.recall is not None:
+                raise ValueError("graph-derived view forbids query and recall")
             if self.graph is None:
                 raise ValueError("graph-derived view requires graph")
             if self.required_capabilities:

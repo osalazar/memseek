@@ -55,6 +55,10 @@ class Settings(BaseSettings):
     # bypasses the prompt/content redaction that normal logging applies; keep it
     # off outside of local debugging.
     llm_debug: bool = False
+    # When true, an owner people search (visibility includes private) logs the
+    # top cosines and returns them on the recall payload. Off by default.
+    # Shareable-only calls never receive the list.
+    recall_debug: bool = False
     llm_max_concurrency: int = 8
     model_context_tokens: int = 60_000
     max_prompt_tokens: int = 50_000

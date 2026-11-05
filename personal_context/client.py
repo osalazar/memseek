@@ -9,7 +9,7 @@ import time
 from uuid import uuid4
 
 import httpx
-from memseek.sdk import MemseekClient
+from memseek.sdk import MemseekClient, MemseekHTTPError
 from .style import normalize_scope, sample_window, style_entity, style_entities_for_frame
 
 DIMENSIONS = ("actions", "channels", "audiences", "recipients", "domains")
@@ -198,17 +198,40 @@ class PersonalContext:
         hard_ids = {h["id"] for h in eligible if h["fields"]["strength"] == "hard"}
         soft_ids = {h["id"] for h in eligible if h["fields"]["strength"] == "soft"
                     and all(set(h["fields"][d]) & set(frame[d]) for d in DIMENSIONS)}
-        bound = await self.mem.artifact("interaction_context@4").bind({
+        bind_args = {
             **{k:v for k,v in frame.items() if k != "language"},
             "style_entities": style_entities_for_frame(self.owner, frame), "owner": self.owner, "now": now,
             "visibility": ["shareable"] if outward else ["shareable", "private"],
-        }, snapshot=True)
+        }
+        # @5 pages task-relevant rules. A catalog that has not been published
+        # forward still serves @4, which returns the older fixed slice.
+        artifact_name = "interaction_context@5"
+        try:
+            bound = await self.mem.artifact(artifact_name).bind(bind_args, snapshot=True)
+        except MemseekHTTPError as exc:
+            if exc.status_code != 404:
+                raise
+            artifact_name = "interaction_context@4"
+            bound = await self.mem.artifact(artifact_name).bind(bind_args, snapshot=True)
         if bound.truncated or not bound.snapshot_id:
-            raise ContextIncomplete("Context was truncated or has no snapshot")
+            raise ContextIncomplete(
+                "Context was truncated or has no snapshot; page blocks via next_offset before acting"
+            )
         snapshot = await self.mem.record(bound.snapshot_id)
         blocks = snapshot["content"]["blocks"]
-        if hard_ids != set(blocks["hard"]["ids"]) or soft_ids != set(blocks["soft"]["ids"]):
-            raise ContextIncomplete("Applicable preferences changed or were omitted; retry before acting")
+        returned_hard = set(blocks["hard"]["ids"])
+        returned_soft = set(blocks["soft"]["ids"])
+        if artifact_name.endswith("@4"):
+            if returned_hard != hard_ids or returned_soft != soft_ids:
+                raise ContextIncomplete("Applicable preferences changed or were omitted; retry before acting")
+        else:
+            # The hard block is a core plus task matches, so it is a subset of
+            # the confirmed hard rules. It must not invent rules, and it must
+            # not come back empty when hard rules exist. Soft rules stay exact.
+            if not returned_hard <= hard_ids or returned_soft != soft_ids:
+                raise ContextIncomplete("Applicable preferences changed or were omitted; retry before acting")
+            if hard_ids and not returned_hard:
+                raise ContextIncomplete("Hard rules exist but context returned none; retry before acting")
         after = await self.mem.document(entity=self.owner, collections=["preferences"])
         if ids != {b["id"] for b in after["beliefs"]}:
             raise ContextIncomplete("Preferences changed during preparation; retry")

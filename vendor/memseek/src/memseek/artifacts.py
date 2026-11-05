@@ -21,6 +21,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from collections.abc import Mapping
 from typing import Any, LiteralString, cast
 from uuid import UUID, uuid4
 
@@ -30,7 +31,7 @@ from memseek import __version__
 from memseek.canonical_records import CanonicalRecordWrite, insert_canonical_record_tx
 from memseek.config import Settings
 from memseek.db import DatabaseConnection, DatabasePool
-from memseek.definitions import ArtifactDefinition, DefinitionCatalog, parameters_json_schema
+from memseek.definitions import ArtifactDefinition, DefinitionCatalog
 from memseek.definitions.base import split_exact_reference
 from memseek.definitions.models import parameter_value_matches
 from memseek.locks import acquire_entity_locks, acquire_workspace_lock
@@ -81,6 +82,11 @@ class _BlockResolution:
     # document block has them, and only they can identify the exact promoted
     # value a learning target must be based on.
     heads: tuple[dict[str, Any], ...] = ()
+    # Continuation of this block. has_more with next_offset is how a caller
+    # fetches the rest; truncated alone is not a stopping point when has_more.
+    offset: int = 0
+    next_offset: int | None = None
+    has_more: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +154,7 @@ def artifact_catalog_payload(catalog: DefinitionCatalog) -> dict[str, Any]:
                 },
                 "input_schema": {
                     "$schema": "https://json-schema.org/draft/2020-12/schema",
-                    **parameters_json_schema(artifact.parameters),
+                    **artifact_parameter_schema(artifact.parameters),
                 },
                 "blocks": sorted(artifact.blocks),
                 "snapshot": (
@@ -167,12 +173,90 @@ def artifact_catalog_payload(catalog: DefinitionCatalog) -> dict[str, Any]:
     return {"artifacts": artifacts}
 
 
+def paging_property(name: str) -> dict[str, Any]:
+    """JSON Schema for one continuation argument.
+
+    ``minimum`` stays an integer. A float ``0.0`` is what the parameter model
+    emits, and some connector clients then drop the property.
+    """
+
+    if name == "offset":
+        description = (
+            "Continue from a block's next_offset. Applies to every block that "
+            "was not given its own *_offset."
+        )
+    else:
+        block = name.removesuffix("_offset")
+        description = (
+            f"Continue the {block} block. Set this to blocks.{block}.next_offset "
+            "when that block's has_more is true."
+        )
+    return {"type": "integer", "minimum": 0, "default": 0, "description": description}
+
+
+def paging_parameter_names() -> tuple[str, ...]:
+    return ("offset", *_BLOCK_OFFSET_PARAMETERS.values())
+
+
+def merge_paging_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Add offset and each *_offset to a tool schema. Catalog params stay."""
+
+    merged = dict(schema)
+    properties = dict(merged.get("properties") or {})
+    for name in paging_parameter_names():
+        properties.setdefault(name, paging_property(name))
+    merged["properties"] = properties
+    merged.setdefault("type", "object")
+    return merged
+
+
+def paging_parameters() -> dict[str, Any]:
+    """offset plus the block continuation names, even on a catalog published earlier."""
+
+    from memseek.definitions.models import ParameterDefinition
+
+    return {
+        name: ParameterDefinition(type="integer", required=False, default=0, minimum=0)
+        for name in paging_parameter_names()
+    }
+
+
+def artifact_parameter_schema(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """Catalog parameters plus the continuation offsets callers page with."""
+
+    from memseek.definitions.models import parameters_json_schema
+
+    return merge_paging_schema(parameters_json_schema(parameters))
+
+
+PAGING_HINT = (
+    " If a block has has_more, call again with that block's next_offset in "
+    "hard_offset, soft_offset, context_offset, people_offset, style_offset, "
+    "or extended_offset. A bare offset sets every one of those blocks."
+)
+
+
+def with_paging_hint(description: str) -> str:
+    """Tell the agent how to turn next_offset into the next call."""
+
+    if "hard_offset" in description and "next_offset" in description:
+        return description
+    return description.rstrip() + PAGING_HINT
+
+
 def resolve_artifact_parameters(
     artifact: ArtifactDefinition, supplied: dict[str, Any]
 ) -> dict[str, Any]:
-    """Validate supplied values against the artifact's typed parameter schema."""
+    """Validate supplied values against the artifact's typed parameter schema.
 
-    unknown = sorted(set(supplied) - set(artifact.parameters))
+    ``offset`` and the ``*_offset`` block names are always accepted. A bare
+    ``offset`` fills any block offset the caller did not set, so page 2 of a
+    block that returned ``next_offset`` is one argument.
+    """
+
+    extras = paging_parameters()
+    allowed = {**extras, **artifact.parameters}
+    unknown = sorted(set(supplied) - set(allowed))
     if unknown:
         raise ArtifactRequestError(
             "artifact_parameter", f"unknown artifact parameter(s): {', '.join(unknown)}"
@@ -195,6 +279,21 @@ def resolve_artifact_parameters(
                 f"artifact parameter {name!r} does not match its declared schema",
             )
         resolved[name] = value
+    for name, parameter in extras.items():
+        if name in artifact.parameters or name not in supplied:
+            continue
+        value = supplied[name]
+        if not parameter_value_matches(parameter, value):
+            raise ArtifactRequestError(
+                "artifact_parameter",
+                f"artifact parameter {name!r} does not match its declared schema",
+            )
+        resolved[name] = value
+    if "offset" in supplied:
+        bare = resolved.get("offset", supplied["offset"])
+        for name in _BLOCK_OFFSET_PARAMETERS.values():
+            if name not in supplied:
+                resolved[name] = bare
     return resolved
 
 
@@ -281,6 +380,74 @@ async def _document_rows(
     return [row for row in rows if row["content"].get("tombstone") is not True]
 
 
+_BLOCK_OFFSET_PARAMETERS = {
+    "hard": "hard_offset",
+    "soft": "soft_offset",
+    "context": "context_offset",
+    "people": "people_offset",
+    "style": "style_offset",
+    "extended": "extended_offset",
+}
+# Structured views that are not recall views stop at their k cap. A full page
+# of this size may have another page behind it.
+_UNPAGED_WINDOW = 200
+
+
+def _stored_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop unused continuation offsets so a first page still replays on older artifacts."""
+
+    hidden = set(_BLOCK_OFFSET_PARAMETERS.values())
+    return {
+        key: value
+        for key, value in parameters.items()
+        if not (key in hidden and value == 0)
+    }
+
+
+def _block_offset(block_name: str, parameters: Mapping[str, Any]) -> int:
+    name = _BLOCK_OFFSET_PARAMETERS.get(block_name)
+    if name is None:
+        return 0
+    value = parameters.get(name, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def continue_block(
+    *,
+    source_offset: int,
+    source_has_more: bool,
+    source_next: int | None,
+    packed: int,
+    returned: int,
+    token_truncated: bool,
+    unpaged_total: int | None,
+    missing: bool,
+) -> tuple[int, int | None, bool, bool]:
+    """Return offset, next_offset, has_more, and truncated for one block.
+
+    ``has_more`` is set only when another call can fetch the remainder, and
+    then ``next_offset`` is the argument to pass. ``truncated`` stays true for
+    a later page that happens to be the last one, which is how a caller knows
+    this render is not the whole block.
+    """
+
+    if token_truncated:
+        return source_offset, source_offset + packed, True, True
+    if source_has_more:
+        nxt = source_next if source_next is not None else source_offset + returned
+        return source_offset, nxt, True, True
+    if (
+        unpaged_total is not None
+        and unpaged_total >= _UNPAGED_WINDOW
+        and packed > 0
+        and source_offset + packed >= unpaged_total
+    ):
+        return source_offset, source_offset + packed, True, True
+    return source_offset, None, False, source_offset > 0 or missing
+
+
 def _pack_block(
     rows: list[dict[str, Any]],
     *,
@@ -339,7 +506,11 @@ async def resolve_artifact_blocks(
     blocks: list[_BlockResolution] = []
     truncated = False
     for block_name, block in artifact.blocks.items():
-        source_truncated = False
+        source_offset = 0
+        source_has_more = False
+        source_next: int | None = None
+        unpaged_total: int | None = None
+        missing = False
         refs: list[dict[str, Any]] = []
         try:
             if block.document is not None:
@@ -378,6 +549,10 @@ async def resolve_artifact_blocks(
                         collections=collections,
                         status=status,
                     )
+                    unpaged_total = len(rows)
+                    source_offset = _block_offset(block_name, parameters)
+                    if source_offset:
+                        rows = rows[source_offset:] if source_offset < len(rows) else []
                     max_seq = await _scope_max_seq(
                         conn,
                         workspace=workspace,
@@ -409,7 +584,16 @@ async def resolve_artifact_blocks(
                     catalog=catalog,
                     settings=settings,
                 )
-                source_truncated = bool(result.get("has_more") or result.get("offset", 0))
+                view_paged = "has_more" in result
+                source_offset = (
+                    int(result.get("offset") or 0)
+                    if view_paged
+                    else _block_offset(block_name, parameters)
+                )
+                source_has_more = bool(result.get("has_more")) if view_paged else False
+                source_next = result.get("next_offset") if view_paged else None
+                if isinstance(source_next, bool) or not isinstance(source_next, int):
+                    source_next = None
                 hit_ids = [UUID(hit["id"]) for hit in result["hits"]]
                 rows = []
                 view_entity = rendered_args.get("entity")
@@ -428,7 +612,10 @@ async def resolve_artifact_blocks(
                         )
                         by_id = {row["id"]: dict(row) for row in await loaded.fetchall()}
                         rows = [by_id[item] for item in hit_ids if item in by_id]
-                        source_truncated = source_truncated or len(rows) != len(hit_ids)
+                    missing = len(rows) != len(hit_ids)
+                    unpaged_total = None if view_paged else len(rows)
+                    if not view_paged and source_offset:
+                        rows = rows[source_offset:] if source_offset < len(rows) else []
                     max_seq = await _scope_max_seq(
                         conn,
                         workspace=workspace,
@@ -462,6 +649,9 @@ async def resolve_artifact_blocks(
             continue
 
         cap_left = settings.max_artifact_input_records - len(seen)
+        from memseek.search.recall_rank import label_unreviewed_rows
+
+        rows = label_unreviewed_rows(rows)
         selected, lines, block_truncated = _pack_block(
             rows,
             catalog=catalog,
@@ -479,7 +669,17 @@ async def resolve_artifact_blocks(
                 seen.add(row["id"])
                 input_ids.append(row["id"])
         rendered_block = render_rows(lines, fence=None)
-        block_truncated = block_truncated or source_truncated
+        page_offset, next_offset, has_more, block_was_cut = continue_block(
+            source_offset=source_offset,
+            source_has_more=source_has_more,
+            source_next=source_next,
+            packed=len(selected),
+            returned=len(rows),
+            token_truncated=block_truncated,
+            unpaged_total=unpaged_total,
+            missing=missing,
+        )
+        block_truncated = block_was_cut
         truncated = truncated or block_truncated
         blocks.append(
             _BlockResolution(
@@ -492,6 +692,9 @@ async def resolve_artifact_blocks(
                 ready=all(row["enriched_at"] is not None for row in selected),
                 omitted=False,
                 truncated=block_truncated,
+                offset=page_offset,
+                next_offset=next_offset,
+                has_more=has_more,
                 definition_refs=tuple(refs),
                 rendered=rendered_block,
                 heads=(
@@ -596,6 +799,9 @@ def _block_manifest(resolution: ArtifactResolution) -> dict[str, Any]:
             "ready": block.ready,
             "omitted": block.omitted,
             "truncated": block.truncated,
+            "offset": block.offset,
+            "next_offset": block.next_offset,
+            "has_more": block.has_more,
             "definition_refs": list(block.definition_refs),
         }
         for block in resolution.blocks
@@ -736,7 +942,7 @@ async def persist_artifact_snapshot(
         "artifact_name": artifact.name,
         "artifact_version": artifact.version,
         "artifact_hash": artifact.definition_hash,
-        "parameters": _json_safe(resolution.parameters),
+        "parameters": _json_safe(_stored_parameters(resolution.parameters)),
         "blocks": _block_manifest(resolution),
         "rendered_sha256": resolution.rendered_sha256,
     }

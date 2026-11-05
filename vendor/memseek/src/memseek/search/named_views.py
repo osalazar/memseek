@@ -63,6 +63,7 @@ def _view_collections(view: ViewDefinition, catalog: DefinitionCatalog) -> list[
                 walk(item)
 
     walk(view.query)
+    walk(getattr(view, "recall", None))
     return sorted(names & {name for name, _ in catalog.collections})
 
 
@@ -156,11 +157,33 @@ async def execute_view(
     except (KeyError, ValueError) as exc:
         raise ViewNotFound(f"unknown view {name!r}") from exc
     paging = None
-    if paginates(view):
+    # extended_context accepts limit/offset/snapshot even when an older
+    # published definition did not list them. Structured views actually page.
+    if paginates(view) or view.name == "extended_context":
         parameters, limit, offset, snapshot = page_arguments(parameters)
-        paging = (limit, offset, snapshot)
+        if paginates(view):
+            paging = (limit, offset, snapshot)
     resolved_parameters = resolve_view_parameters(view, parameters)
     view_metadata = {"name": view.name, "version": view.version, "hash": view.definition_hash}
+    if view.kind == "recall":
+        from memseek.search.recall import execute_recall
+
+        assert view.recall is not None
+        try:
+            rendered_recall = render_object(view.recall, resolved_parameters)
+        except TemplateError as exc:
+            raise SearchRequestError("view_parameter", str(exc)) from exc
+        if not isinstance(rendered_recall, dict):
+            raise SearchRequestError("recall_target", "recall view did not render an object")
+        return await execute_recall(
+            pool,
+            workspace=workspace,
+            view=view,
+            parameters=resolved_parameters,
+            rendered=rendered_recall,
+            catalog=catalog,
+            settings=settings,
+        )
     if view.kind == "graph":
         from memseek.graph import GraphTraversalError, GraphTraversalRequest, traverse_graph
 

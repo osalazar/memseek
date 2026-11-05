@@ -1,7 +1,7 @@
 views:
 - name: relevant_people
   version: 1
-  active: true
+  active: false
   parameters:
     owner:
       type: string

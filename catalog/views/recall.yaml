@@ -1,0 +1,140 @@
+# Task recall. relevant_rules keeps a small always-on core of the highest-priority
+# hard rules and then the rules that match the task (semantic + keyword), newest
+# seq first when scores tie. relevant_context searches life notes and rules.
+# relevant_people matches names before vectors. offset/limit page every target.
+views:
+- name: relevant_rules
+  version: 1
+  active: true
+  kind: recall
+  parameters:
+    owner:
+      type: string
+      required: true
+    now:
+      type: integer
+      required: true
+      minimum: 0
+    task:
+      type: string
+      required: true
+    offset:
+      type: integer
+      required: false
+      default: 0
+      minimum: 0
+    limit:
+      type: integer
+      required: false
+      default: 40
+      minimum: 1
+      maximum: 100
+  recall:
+    target: rules
+    scope:
+      collections:
+      - preferences
+    entity: '{{owner}}'
+    task: '{{task}}'
+    now: '{{now}}'
+    offset: '{{offset}}'
+    limit: '{{limit}}'
+- name: relevant_context
+  version: 2
+  active: true
+  kind: recall
+  parameters:
+    owner:
+      type: string
+      required: true
+    now:
+      type: integer
+      required: true
+      minimum: 0
+    task:
+      type: string
+      required: true
+    visibility:
+      type: string_array
+      required: false
+      item_enum:
+      - private
+      - shareable
+      default:
+      - private
+      - shareable
+      min_items: 1
+    offset:
+      type: integer
+      required: false
+      default: 0
+      minimum: 0
+    limit:
+      type: integer
+      required: false
+      default: 6
+      minimum: 1
+      maximum: 100
+  recall:
+    target: context
+    scope:
+      collections:
+      - life_context
+      - preferences
+    entity: '{{owner}}'
+    task: '{{task}}'
+    now: '{{now}}'
+    visibility: '{{visibility}}'
+    offset: '{{offset}}'
+    limit: '{{limit}}'
+- name: relevant_people
+  version: 2
+  active: true
+  kind: recall
+  parameters:
+    owner:
+      type: string
+      required: true
+    now:
+      type: integer
+      required: true
+      minimum: 0
+    task:
+      type: string
+      required: true
+    visibility:
+      type: string_array
+      required: false
+      item_enum:
+      - private
+      - shareable
+      default:
+      - private
+      - shareable
+      min_items: 1
+    offset:
+      type: integer
+      required: false
+      default: 0
+      minimum: 0
+    limit:
+      type: integer
+      required: false
+      default: 6
+      minimum: 1
+      maximum: 100
+  recall:
+    target: people
+    scope:
+      collections:
+      - people
+      collection_versions:
+        people:
+        - 1
+        - 2
+    entity: '{{owner}}'
+    task: '{{task}}'
+    now: '{{now}}'
+    visibility: '{{visibility}}'
+    offset: '{{offset}}'
+    limit: '{{limit}}'

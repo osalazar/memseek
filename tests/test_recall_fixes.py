@@ -1,0 +1,713 @@
+"""Outcomes 1–4: rule recall, private matching, name search, people loader."""
+
+from __future__ import annotations
+
+import json
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "vendor" / "memseek" / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from memseek.artifacts import continue_block
+from memseek.search.names import fold_name, name_identity, name_score
+from memseek.search.recall import recall_debug_enabled
+from memseek.search.recall_rank import label_unreviewed_text, select_context, select_people, select_rules
+
+import backfill_embeddings
+import load_people
+
+FOREVER = 253402300799
+
+
+def rule(identity, text, *, priority=50, seq=1, strength="hard", similarity=0.0, text_match=0.0):
+    return {
+        "id": identity,
+        "seq": seq,
+        "collection": "preferences",
+        "similarity": similarity,
+        "text_match": text_match,
+        "content": {
+            "text": text,
+            "activation": "confirmed",
+            "strength": strength,
+            "priority": priority,
+            "valid_until": FOREVER,
+        },
+    }
+
+
+def note(identity, text, *, visibility="private", collection="life_context", seq=1, similarity=0.0):
+    return {
+        "id": identity,
+        "seq": seq,
+        "collection": collection,
+        "similarity": similarity,
+        "text_match": 0.0,
+        "content": {
+            "text": text,
+            "activation": "confirmed",
+            "visibility": visibility,
+            "kind": "fact",
+            "valid_until": FOREVER,
+        },
+    }
+
+
+def person(identity, text, *, visibility="private", seq=1, similarity=0.0, activation="confirmed"):
+    return {
+        "id": identity,
+        "seq": seq,
+        "collection": "people",
+        "similarity": similarity,
+        "text_match": 0.0,
+        "content": {
+            "text": text,
+            "activation": activation,
+            "visibility": visibility,
+            "kind": "relationship",
+            "valid_until": FOREVER,
+        },
+    }
+
+
+class RulesRecall(unittest.TestCase):
+    def test_core_plus_relevant_newest_first_and_pages(self):
+        rows = [
+            rule("old-low", "Keep archives.", priority=10, seq=1),
+            rule("new-low", "Keep archives too.", priority=10, seq=9),
+            rule("top", "Never disclose private medical reasons.", priority=100, seq=2),
+            rule("email-old", "For client emails, use a concise style.", priority=30, seq=3, similarity=0.4),
+            rule("email-new", "For client emails, use a concise style.", priority=30, seq=8, similarity=0.4),
+            rule("plants", "Water the plants on Sunday.", priority=15, seq=4),
+        ]
+        page = select_rules(
+            rows, query="Email the client a concise update", now=1_700_000_000,
+            offset=0, limit=10, core_size=1,
+        )
+        self.assertEqual(page.core_ids, ("top",))
+        self.assertEqual(page.ids[0], "top")
+        self.assertEqual(page.ids[1:], ("email-new", "email-old"))
+        self.assertNotIn("plants", page.ids)
+        self.assertNotIn("old-low", page.ids)
+        self.assertFalse(page.has_more)
+
+        paged = select_rules(
+            rows, query="Email the client a concise update", now=1_700_000_000,
+            offset=1, limit=1, core_size=1,
+        )
+        self.assertEqual(paged.ids, ("email-new",))
+        self.assertTrue(paged.has_more)
+        self.assertEqual(paged.next_offset, 2)
+        rest = select_rules(
+            rows, query="Email the client a concise update", now=1_700_000_000,
+            offset=paged.next_offset, limit=10, core_size=1,
+        )
+        self.assertEqual(rest.ids, ("email-old",))
+        self.assertFalse(rest.has_more)
+
+    def test_tie_on_score_keeps_the_newer_rule(self):
+        rows = [
+            rule("older", "Mention the atlas project in the note.", priority=5, seq=1, similarity=0.9),
+            rule("newer", "Mention the atlas project in the note.", priority=5, seq=8, similarity=0.9),
+            rule("core", "Always be kind.", priority=100, seq=1),
+        ]
+        page = select_rules(rows, query="atlas project", now=1, offset=0, limit=10, core_size=1)
+        matched = [item for item in page.ids if item != "core"]
+        self.assertEqual(matched, ["newer", "older"])
+
+
+class MatchingVisibility(unittest.TestCase):
+    def test_owner_sees_private_notes_and_rules_shareable_scope_does_not(self):
+        rows = [
+            note("secret", "Private cancellation reason: SYNTHETIC_MEDICAL_SECRET."),
+            note("atlas", "Sarah's work meeting concerns the synthetic Atlas project.", visibility="shareable", seq=2),
+            note("other-owner", "OTHER_OWNER_MARKER", visibility="private"),
+            rule("privacy", "Never disclose private medical reasons.", priority=100, seq=3),
+        ]
+        # The other owner is a different entity and is not in this result set.
+        owned = [row for row in rows if row["id"] != "other-owner"]
+        internal = select_context(
+            owned,
+            query="Research Atlas",
+            now=1,
+            visibility={"private", "shareable"},
+            offset=0,
+            limit=6,
+        )
+        self.assertIn("secret", internal.ids)
+        self.assertIn("atlas", internal.ids)
+        self.assertNotIn("other-owner", internal.ids)
+
+        outward = select_context(
+            owned,
+            query="Research Atlas",
+            now=1,
+            visibility={"shareable"},
+            offset=0,
+            limit=6,
+        )
+        self.assertNotIn("secret", outward.ids)
+        self.assertIn("atlas", outward.ids)
+
+    def test_matching_includes_a_relevant_rule(self):
+        rows = [
+            note(f"n{i}", f"Unrelated note {i} about commuting.", seq=i)
+            for i in range(10)
+        ]
+        rows.append(rule("email-rule", "For client emails, use bullet points.", seq=50))
+        page = select_context(
+            rows,
+            query="Write the client email",
+            now=1,
+            visibility={"private", "shareable"},
+            offset=0,
+            limit=6,
+        )
+        self.assertIn("email-rule", page.ids)
+        self.assertTrue(all(not item.startswith("n") for item in page.ids))
+
+    def test_small_note_set_is_not_dropped(self):
+        rows = [
+            note("secret", "Private cancellation reason: SYNTHETIC_MEDICAL_SECRET."),
+            note("atlas", "Sarah's work meeting concerns the synthetic Atlas project.", visibility="shareable"),
+        ]
+        page = select_context(
+            rows, query="Research Atlas", now=1, visibility={"private", "shareable"}, offset=0, limit=6
+        )
+        self.assertCountEqual(page.ids, ["secret", "atlas"])
+
+
+class PeopleNames(unittest.TestCase):
+    def test_accent_and_alias_and_title_and_empty_miss(self):
+        rows = [
+            person("alcivar", "Name: Juan Alcívar\nRole: neighbor"),
+            person("barba", "Name: Elizabeth Barba Orozco\nAliases: Dra. Barba\nRole: physician"),
+            person("other", "Name: Marcos Peña\nRole: unrelated"),
+            person("candidate", "Name: Elizabeth Barba\nRole: duplicate", activation="candidate"),
+            person("shareable", "Name: Elena Barba\nRole: public", visibility="shareable"),
+        ]
+        alcivar = select_people(
+            rows, query="Alcivar", now=1, visibility={"private", "shareable"}, offset=0, limit=6
+        )
+        self.assertEqual(alcivar.ids, ("alcivar",))
+
+        barba = select_people(
+            rows, query="Dra. Barba", now=1, visibility={"private", "shareable"}, offset=0, limit=6
+        )
+        self.assertEqual(barba.ids[0], "barba")
+        self.assertNotIn("candidate", barba.ids)
+
+        self.assertGreater(name_score("Alcivar", rows[0]["content"]), 0.9)
+        self.assertGreaterEqual(name_score("Dra. Barba", rows[1]["content"]), 0.8)
+        self.assertEqual(fold_name("Alcívar"), "alcivar")
+
+        miss = select_people(
+            rows, query="zzzz-not-a-person", now=1, visibility={"private", "shareable"}, offset=0, limit=6
+        )
+        self.assertEqual(miss.ids, ())
+        self.assertFalse(miss.has_more)
+
+        shareable = select_people(
+            rows, query="Barba", now=1, visibility={"shareable"}, offset=0, limit=6
+        )
+        self.assertEqual(shareable.ids, ("shareable",))
+
+    def test_archivist_candidates_are_found_and_rank_below_reviewed(self):
+        reviewed = person(
+            "reviewed-barba",
+            "Name: Elizabeth Barba Orozco\nRole: physician",
+            seq=2,
+            similarity=0.4,
+        )
+        reviewed["content"]["reviewed"] = True
+        candidate = person(
+            "file-barba",
+            "Name: Elizabeth Barba Orozco\nRole: physician",
+            activation="candidate",
+            seq=9,
+            similarity=0.4,
+        )
+        candidate["content"]["reviewed"] = False
+        candidate["content"]["source"] = "archivist-file"
+        other_candidate = person(
+            "guess",
+            "Name: Elizabeth Barba\nUNCONFIRMED_MARKER",
+            activation="candidate",
+            seq=3,
+        )
+        rows = [reviewed, candidate, other_candidate]
+        page = select_people(
+            rows, query="Dra. Barba", now=1, visibility={"private", "shareable"}, offset=0, limit=6
+        )
+        self.assertEqual(page.ids, ("reviewed-barba",))
+        self.assertNotIn("file-barba", page.ids)
+        self.assertNotIn("guess", page.ids)
+        self.assertIn("(unreviewed)", label_unreviewed_text(candidate["content"]).casefold())
+
+        hidden = select_people(
+            rows, query="Dra. Barba", now=1, visibility={"shareable"}, offset=0, limit=6
+        )
+        self.assertNotIn("file-barba", hidden.ids)
+        self.assertNotIn("reviewed-barba", hidden.ids)
+
+    def test_name_match_ranks_above_a_stronger_semantic_hit(self):
+        rows = [
+            person("semantic", "Name: Marcos Peña\nRole: catalogs", similarity=0.95),
+            person("named", "Name: Elizabeth Barba Orozco", similarity=0.05),
+        ]
+        page = select_people(
+            rows, query="Barba", now=1, visibility={"private"}, offset=0, limit=6
+        )
+        self.assertEqual(page.ids[0], "named")
+
+    def test_exact_surname_drops_prefix_and_fuzzy(self):
+        rows = [
+            person("elizabeth", "Name: Dra. Elizabeth Barba Orozco\nAliases: Dra. Barba"),
+            person("barbara", "Name: Bárbara Chaves"),
+            person("barra", "Name: Carlos de la Barra"),
+        ]
+        page = select_people(
+            rows, query="Barba", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(page.ids, ("elizabeth",))
+        only_fuzzy = select_people(
+            rows[1:], query="Barba", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(only_fuzzy.ids[0], "barbara")
+
+    def test_nonsense_ignores_negative_aliases_notes_and_loose_fuzzy(self):
+        def record(identity, name, aliases="", notes="", **kwargs):
+            lines = [f"Name: {name}"]
+            if aliases:
+                lines.append(f"Aliases: {aliases}")
+            if notes:
+                lines.append(f"Notes: {notes}")
+            lines.append("Role: neighbor")
+            return person(identity, "\n".join(lines), **kwargs)
+
+        rows = [
+            record("osp", "OSP", aliases="not Chloe Gray, not other Juliens", notes="in-person meeting"),
+            record("sebas", "Sebastian Ortega", aliases="Sebas, not other Juliens"),
+            record("paz", "Paz Andrade", notes="met in-person last year"),
+            record("persson", "Lars Persson"),
+            record("gerson", "Rick Gerson"),
+            record("chloe", "Chloe Gray", aliases="not Chloe Gray"),
+        ]
+        miss = select_people(
+            rows, query="zzzz-not-a-person", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(miss.total, 0)
+        self.assertEqual(miss.ids, ())
+        self.assertEqual(name_score("zzzz-not-a-person", rows[0]["content"]), 0.0)
+        self.assertEqual(name_score("person", {"name": "Lars Persson"}), 0.0)
+        self.assertEqual(name_score("person", {"name": "Rick Gerson"}), 0.0)
+        self.assertEqual(name_score("Gerson", {"name": "Lars Persson"}), 0.0)
+        self.assertGreaterEqual(name_score("Barva", {"name": "Elizabeth Barba"}), 0.9)
+
+    def test_full_name_beats_a_shared_given_name(self):
+        rows = [
+            person("full", "Name: Juan Diego Caballero"),
+            person("longer", "Name: Juan Diego Caballero de la Vega"),
+            person("juan", "Name: Juan Perez"),
+            person("partial", "Name: Diego Caballero"),
+            person("other", "Name: Maria Lopez"),
+        ]
+        page = select_people(
+            rows,
+            query="Juan Diego Caballero",
+            now=1,
+            visibility={"private"},
+            offset=0,
+            limit=10,
+        )
+        self.assertEqual(page.ids, ("full", "longer"))
+
+        only_partial = select_people(
+            rows[2:],
+            query="Juan Diego Caballero",
+            now=1,
+            visibility={"private"},
+            offset=0,
+            limit=10,
+        )
+        self.assertEqual(only_partial.ids, ("partial",))
+
+    def test_barba_alcivar_edwin_and_sebas_rank_the_right_person_first(self):
+        rows = [
+            person("barba", "Name: Dra. Elizabeth Barba Orozco\nAliases: Dra. Barba"),
+            person("other-barba", "Name: Elena Barba", activation="candidate"),
+            person("alcivar", "Name: Cristian Alcívar Conde"),
+            person("other-alcivar", "Name: Maria Alcivar", activation="candidate"),
+            person("edwin", "Name: Edwin Campbell"),
+            person("edwin-other", "Name: Edwin Morales"),
+            person("campbell", "Name: Ana Campbell"),
+            person("sebas", "Name: Sebastian Ortega\nAliases: Sebas"),
+            person("sebastian", "Name: Sebastian Paz", activation="candidate"),
+        ]
+        rows[6]["content"]["source"] = "archivist-file"
+        rows[1]["content"]["source"] = "archivist-file"
+        rows[1]["content"]["reviewed"] = False
+        rows[3]["content"]["source"] = "archivist-file"
+        rows[3]["content"]["reviewed"] = False
+        rows[8]["content"]["source"] = "archivist-file"
+        rows[8]["content"]["reviewed"] = False
+        for query, first in (
+            ("Barba", "barba"),
+            ("Alcívar", "alcivar"),
+            ("Edwin Campbell", "edwin"),
+            ("Sebas", "sebas"),
+        ):
+            page = select_people(
+                rows, query=query, now=1, visibility={"private"}, offset=0, limit=10
+            )
+            self.assertGreaterEqual(len(page.ids), 1, query)
+            self.assertEqual(page.ids[0], first, query)
+        edwin = select_people(
+            rows, query="Edwin Campbell", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(edwin.ids, ("edwin",))
+
+        prose = person("alex", "Alex A is an executive coach. PRIVATE_PEOPLE_MARKER.")
+        found = select_people(
+            [prose], query="Who is Alex?", now=1, visibility={"private"}, offset=0, limit=5
+        )
+        self.assertEqual(found.ids, ("alex",))
+        missed = select_people(
+            [prose],
+            query="Who is Alex, my executive coach?",
+            now=1,
+            visibility={"private"},
+            offset=0,
+            limit=5,
+        )
+        self.assertEqual(missed.ids, ())
+
+    def test_reviewed_prose_name_hides_the_archivist_copy(self):
+        def reviewed(identity, text):
+            row = person(identity, text)
+            row["content"]["activation"] = "confirmed"
+            return row
+
+        def copy(identity, text):
+            row = person(identity, text, activation="candidate", seq=9)
+            row["content"]["source"] = "archivist-file"
+            row["content"]["reviewed"] = False
+            return row
+
+        rows = [
+            reviewed("sebas", "Sebastian (Sebas). Owner reviewed. Lives in Quito."),
+            copy("sebas-file", "Name: Sebastian\nAliases: Sebas\nNotes: in-person meeting"),
+            copy("other-sebas", "Name: Sebastian Paz\nRole: neighbor"),
+            reviewed("osp", "OSP (Oscar Salazar, father). Owner reviewed this record."),
+            copy("osp-file", "Name: OSP\nRole: parent"),
+            copy("oscar-file", "Name: Oscar Salazar\nRole: parent"),
+            reviewed("edwin", "Edwin Campbell. Owner reviewed."),
+            copy("edwin-file", "Name: Edwin Campbell\nRole: colleague"),
+            copy("notes", "Name: Paz Andrade\nNotes: in-person meeting\nAliases: not Chloe Gray"),
+        ]
+        sebas = select_people(
+            rows, query="Sebas", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(sebas.ids[0], "sebas")
+        self.assertNotIn("sebas-file", sebas.ids)
+
+        osp = select_people(rows, query="OSP", now=1, visibility={"private"}, offset=0, limit=10)
+        self.assertEqual(osp.ids, ("osp",))
+
+        edwin = select_people(
+            rows, query="Edwin Campbell", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(edwin.ids, ("edwin",))
+
+        nonsense = select_people(
+            rows, query="zzzz-not-a-person", now=1, visibility={"private"}, offset=0, limit=10
+        )
+        self.assertEqual(nonsense.ids, ())
+        self.assertEqual(
+            name_score("Sebas", {"text": "Sebastian (Sebas). Owner reviewed."}),
+            1.0,
+        )
+        self.assertIn("oscar salazar", name_identity({"text": "OSP (Oscar Salazar, father). Owner reviewed."}))
+
+    def test_recall_debug_is_owner_only_and_off_by_default(self):
+        class _Settings:
+            recall_debug = False
+
+        self.assertFalse(recall_debug_enabled(_Settings(), {"private", "shareable"}))
+        _Settings.recall_debug = True
+        self.assertTrue(recall_debug_enabled(_Settings(), {"private"}))
+        self.assertFalse(recall_debug_enabled(_Settings(), {"shareable"}))
+
+
+class Paging(unittest.TestCase):
+    def test_token_cut_is_not_a_dead_end(self):
+        offset, nxt, has_more, truncated = continue_block(
+            source_offset=0,
+            source_has_more=False,
+            source_next=None,
+            packed=12,
+            returned=40,
+            token_truncated=True,
+            unpaged_total=None,
+            missing=False,
+        )
+        self.assertTrue(truncated)
+        self.assertTrue(has_more)
+        self.assertEqual(nxt, 12)
+        self.assertEqual(offset, 0)
+
+    def test_last_page_tells_the_caller_to_stop(self):
+        _offset, nxt, has_more, truncated = continue_block(
+            source_offset=12,
+            source_has_more=False,
+            source_next=None,
+            packed=4,
+            returned=4,
+            token_truncated=False,
+            unpaged_total=None,
+            missing=False,
+        )
+        self.assertTrue(truncated)
+        self.assertFalse(has_more)
+        self.assertIsNone(nxt)
+
+    def test_view_has_more_exposes_next_offset(self):
+        _offset, nxt, has_more, truncated = continue_block(
+            source_offset=0,
+            source_has_more=True,
+            source_next=40,
+            packed=40,
+            returned=40,
+            token_truncated=False,
+            unpaged_total=None,
+            missing=False,
+        )
+        self.assertTrue(has_more and truncated)
+        self.assertEqual(nxt, 40)
+
+
+class PeopleLoader(unittest.TestCase):
+    SAMPLE = "\n".join(
+        [
+            "# comment",
+            "LOCK this section",
+            "KEEP another",
+            "Name|reach|role|P#|LANG|notes",
+            "Elizabeth Barba Orozco|barba@example.com|physician|P1|ES|Dra. Barba",
+            "Juan Alcívar|HOLE|neighbor|P2|ES",
+            "Elizabeth Barba Orozco|barba@example.com|physician|P1|ES|Dra. Barba",
+        ]
+    )
+
+    def test_parse_skips_header_and_marks_unreviewed_private_candidates(self):
+        people, _notes = load_people.parse_people(self.SAMPLE)
+        self.assertEqual(len(people), 2)
+        first = people[0]["content"]
+        self.assertEqual(first["activation"], "candidate")
+        self.assertEqual(first["visibility"], "private")
+        self.assertEqual(first["biography_source_claim"], "archivist-file")
+        self.assertEqual(first["source"], "archivist-file")
+        self.assertIs(first["reviewed"], False)
+        self.assertNotIn("review_id", first)
+        self.assertIn("(unreviewed)", people[0]["text"].casefold())
+        self.assertIn("UNREVIEWED CANDIDATE", people[0]["text"])
+        self.assertIn("not owner-reviewed", people[0]["text"])
+        self.assertIn("Alcívar", people[1]["text"])
+        self.assertIn("Name: Elizabeth Barba Orozco", people[0]["text"])
+        self.assertIn("Print: Dra. Barba", people[0]["text"])
+        self.assertNotIn("Aliases:", people[0]["text"])
+        self.assertIn("reach unknown", people[1]["text"])
+        self.assertNotIn("HOLE", people[1]["text"])
+
+    def test_reparse_is_idempotent(self):
+        first, _ = load_people.parse_people(self.SAMPLE)
+        second, _ = load_people.parse_people(self.SAMPLE)
+        self.assertEqual([row["key"] for row in first], [row["key"] for row in second])
+        self.assertEqual([row["dedupe_key"] for row in first], [row["dedupe_key"] for row in second])
+        self.assertEqual(len({row["key"] for row in first}), 2)
+
+    def test_dry_run_does_not_need_the_network(self):
+        path = ROOT / "tests" / "_people_sample.txt"
+        path.write_text(self.SAMPLE, encoding="utf-8")
+        try:
+            summary = load_people.load(path, owner="owner", dry_run=True, batch_size=20, pause=0, url="http://127.0.0.1:9")
+        finally:
+            path.unlink()
+        self.assertTrue(summary["dry_run"])
+        self.assertEqual(summary["parsed"], 2)
+        self.assertEqual(summary["inserted"], 0)
+        self.assertFalse(summary["reviewed"])
+
+    def test_prose_lines_are_counted_and_a_tty_is_refused(self):
+        text = "\n".join(
+            [
+                "This prose note has no columns and must not abort the load.",
+                "also|short",
+                "Name|reach|role",
+                "Ana Garcia|HOLE|friend",
+            ]
+        )
+        people, notes = load_people.parse_people(text)
+        self.assertEqual(len(people), 1)
+        self.assertEqual(sum(1 for note in notes if note.endswith(": prose")), 2)
+        summary = load_people.load_text(
+            text, owner="owner", source="mem", dry_run=True, batch_size=20, pause=0, url="http://127.0.0.1:9"
+        )
+        self.assertEqual(summary["skipped_prose"], 2)
+        self.assertEqual(summary["parsed"], 1)
+
+    def test_loader_skips_a_name_already_reviewed(self):
+        import check_people_duplicates
+
+        text = "\n".join(
+            [
+                "Edwin Campbell|HOLE|colleague",
+                "Ana Garcia|HOLE|friend",
+            ]
+        )
+        people, _notes = load_people.parse_people(text)
+        kept, skipped = load_people.omit_reviewed_copies(people, {"edwin campbell"})
+        self.assertEqual(skipped, 1)
+        self.assertEqual([person["name"] for person in kept], ["Ana Garcia"])
+        rows = [
+            {
+                "entity": "owner",
+                "id": "reviewed",
+                "content": {
+                    "text": "Edwin Campbell. Owner reviewed.",
+                    "activation": "confirmed",
+                    "visibility": "private",
+                    "valid_until": FOREVER,
+                },
+            },
+            {
+                "entity": "owner",
+                "id": "copy",
+                "content": {
+                    "text": "Name: Edwin Campbell\nRole: colleague",
+                    "activation": "candidate",
+                    "source": "archivist-file",
+                    "reviewed": False,
+                    "visibility": "private",
+                    "valid_until": FOREVER,
+                },
+            },
+            {
+                "entity": "owner",
+                "id": "other",
+                "content": {
+                    "text": "Name: Ana Garcia\nRole: friend",
+                    "activation": "candidate",
+                    "source": "archivist-file",
+                    "reviewed": False,
+                    "visibility": "private",
+                    "valid_until": FOREVER,
+                },
+            },
+        ]
+        self.assertEqual(check_people_duplicates.count_duplicate_candidates(rows), {"duplicates": 1})
+
+    def test_columns_aliases_and_remap_plan(self):
+        text = "\n".join(
+            [
+                "# comment",
+                "## also a comment",
+                "OPS: one-line FILE name|x|y|P1|ES|note",
+                "House: kitchen|a|b",
+                "Maria Leticia Guelfi (Leticia)|hole|friend|—|ES|4w2 polite warm",
+                "Luis Prado|aka Neto|colleague|P3|EN|3w5 type only|extra print",
+                "Ana|reach HOLE|neighbor|P1|ES",
+            ]
+        )
+        people, notes = load_people.parse_people(text)
+        self.assertEqual([person["name"] for person in people], [
+            "Maria Leticia Guelfi (Leticia)",
+            "Luis Prado",
+            "Ana",
+        ])
+        self.assertTrue(any(note.endswith(": skipped") for note in notes))
+        maria, luis, ana = people
+        self.assertEqual(
+            next(line for line in maria["text"].splitlines() if line.startswith("Aliases:")),
+            "Aliases: Leticia",
+        )
+        self.assertIn("Print: 4w2 polite warm", maria["text"])
+        self.assertIn("reach unknown", maria["text"])
+        self.assertNotIn("HOLE", maria["text"])
+        self.assertIn("Priority: —", maria["text"])
+        self.assertIn("Language: ES", maria["text"])
+        self.assertIn("Aliases: Neto", luis["text"])
+        self.assertIn("Print: 3w5 type only | extra print", luis["text"])
+        self.assertIn("reach unknown", ana["text"])
+        stored = [
+            {
+                "key": "archivist-maria",
+                "content": {
+                    "source": "archivist-file",
+                    "text": "Name: Maria Leticia Guelfi (Leticia)\nReach: HOLE\nPrint: old",
+                },
+            },
+            {
+                "key": "archivist-junk",
+                "content": {"source": "archivist-file", "text": "Name: OPS: one-line FILE name\nRole: header"},
+            },
+            {
+                "key": "reviewed-person",
+                "content": {"text": "Name: Someone Reviewed. Owner reviewed.", "activation": "confirmed"},
+            },
+        ]
+        plan = load_people.plan_remap(people, stored)
+        self.assertEqual(plan["updated"], 1)
+        self.assertEqual(plan["unchanged"], 0)
+        self.assertEqual(plan["missing"], 2)
+        self.assertEqual(plan["not_found"], 1)
+        self.assertEqual(plan["not_found_names"], ["ops: one-line file name"])
+        self.assertEqual(plan["changes"][0][1]["key"], "archivist-maria")
+
+        class _Tty:
+            def isatty(self):
+                return True
+
+            def read(self):
+                raise AssertionError("a terminal must not be read")
+
+        import io
+        from unittest.mock import patch
+
+        with patch("sys.stdin", _Tty()), self.assertRaises(SystemExit):
+            load_people.read_source(None)
+        with patch("sys.stdin", io.StringIO("Ana Garcia|HOLE|friend\n")):
+            body, label = load_people.read_source("-")
+        self.assertEqual(label, "stdin")
+        self.assertIn("Ana Garcia", body)
+
+
+class BackfillEstimate(unittest.TestCase):
+    def test_cost_is_a_few_cents_for_the_live_corpus(self):
+        estimate = backfill_embeddings.estimate_cost()
+        self.assertEqual(estimate["model"], "text-embedding-3-small")
+        self.assertEqual(estimate["usd_per_million_input_tokens"], 0.02)
+        self.assertLess(estimate["usd"], 0.05)
+        self.assertGreater(estimate["tokens"], 300_000)
+        text = json.dumps(estimate)
+        self.assertNotIn("api_key", text.casefold())
+
+
+class CatalogShape(unittest.TestCase):
+    def test_package_and_rollback_files_exist(self):
+        package = (ROOT / "catalog" / "packages" / "personal_context_v5.yaml").read_text(encoding="utf-8")
+        self.assertIn("version: 0.5.0", package)
+        self.assertIn("interaction_context@5", package)
+        self.assertIn("embedding_rules", package)
+        rollback = list((ROOT / "rollback" / "catalog-0.4.0").rglob("*.yaml"))
+        self.assertEqual(len(rollback), 32)
+        old = (ROOT / "rollback" / "catalog-0.4.0" / "packages" / "personal_context_v4.yaml").read_text(encoding="utf-8")
+        self.assertIn("version: 0.4.0", old)
+        self.assertNotIn("embedding_rules", old)
+
+
+if __name__ == "__main__":
+    unittest.main()

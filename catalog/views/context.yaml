@@ -165,7 +165,7 @@ views:
     where: {}
 - name: relevant_context
   version: 1
-  active: true
+  active: false
   parameters:
     owner: *id001
     now: *id002

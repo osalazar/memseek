@@ -97,10 +97,18 @@ def _as_mcp_tool(descriptor: Mapping[str, Any]) -> mcp_types.Tool:
     # published before offset existed still shows the fields.
     advertised = dict(input_schema)
     text = description if isinstance(description, str) else None
-    if kind == "artifact":
+    if kind == "artifact" or name == "extended_context":
         from memseek.artifacts import merge_paging_schema, with_paging_hint
+        from memseek.search.pagination import PAGE_PROPERTIES
 
-        advertised = merge_paging_schema(advertised)
+        if kind == "artifact":
+            advertised = merge_paging_schema(advertised)
+        if name == "extended_context":
+            properties = dict(advertised.get("properties") or {})
+            for key, value in PAGE_PROPERTIES.items():
+                properties.setdefault(key, value)
+            advertised = {**advertised, "type": "object", "properties": properties}
+            advertised["additionalProperties"] = False
         if text is not None:
             text = with_paging_hint(text)
     return mcp_types.Tool(

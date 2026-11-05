@@ -157,9 +157,12 @@ async def execute_view(
     except (KeyError, ValueError) as exc:
         raise ViewNotFound(f"unknown view {name!r}") from exc
     paging = None
-    if paginates(view):
+    # extended_context accepts limit/offset/snapshot even when an older
+    # published definition did not list them. Structured views actually page.
+    if paginates(view) or view.name == "extended_context":
         parameters, limit, offset, snapshot = page_arguments(parameters)
-        paging = (limit, offset, snapshot)
+        if paginates(view):
+            paging = (limit, offset, snapshot)
     resolved_parameters = resolve_view_parameters(view, parameters)
     view_metadata = {"name": view.name, "version": view.version, "hash": view.definition_hash}
     if view.kind == "recall":

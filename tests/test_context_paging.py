@@ -77,6 +77,46 @@ class AdvertisedContextSchema(unittest.TestCase):
         self.assertIn("offset", tool.input_schema["properties"])
         self.assertIn("context_offset", tool.input_schema["properties"])
         self.assertIn("next_offset", tool.description or "")
+        self.assertIn("hard_offset", tool.description or "")
+
+    def test_extended_context_schema_lists_paging_and_a_cut_page_continues(self):
+        from memseek.mcp_server import _as_mcp_tool
+        from memseek.search.pagination import fits_in_render, view_input_schema
+
+        class _View:
+            name = "extended_context"
+            kind = "search"
+            query = {"mode": "hybrid", "k": 6}
+            parameters: dict = {}
+
+        schema = view_input_schema(_View())
+        for name in ("limit", "offset", "snapshot"):
+            self.assertIn(name, schema["properties"])
+        self.assertIs(schema["additionalProperties"], False)
+        tool = _as_mcp_tool(
+            {
+                "name": "extended_context",
+                "kind": "view",
+                "description": "Retrieve owner-endorsed extended context.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"owner": {"type": "string"}, "task": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            }
+        )
+        for name in ("limit", "offset", "snapshot"):
+            self.assertIn(name, tool.input_schema["properties"])
+        self.assertIs(tool.input_schema["additionalProperties"], False)
+        self.assertIn("next_offset", tool.description or "")
+        # 126 records do not fit. The page keeps a prefix and the rest is the next page.
+        kept = fits_in_render([400] * 126, budget=1000, overhead=100)
+        self.assertGreater(kept, 0)
+        self.assertLess(kept, 126)
+        has_more = kept < 126
+        rendered_truncated = False
+        self.assertTrue(has_more)
+        self.assertFalse(rendered_truncated and not has_more)
 
 
 class ContextOffsetPaging(unittest.TestCase):

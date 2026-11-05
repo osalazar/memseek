@@ -230,10 +230,12 @@ def _tool_payload(
         reference = declaration.view
         assert reference is not None  # Guaranteed by McpToolDefinition validation.
         view = catalog.resolve_view(reference)
-        if paginates(view):
-            payload["description"] += (" Enumerate hits using limit/offset/snapshot; continue until has_more=false, "
-                "then verify unique IDs equal total_count. Keep query arguments fixed across pages. "
-                "On page_changed restart. rendered_truncated concerns only rendered text; hits retain full text.")
+        if paginates(view) or declaration.name == "extended_context":
+            payload["description"] += (
+                " Page with limit, offset, and snapshot. When has_more is true, "
+                "call again with offset set to next_offset and the same snapshot. "
+                "A page lists only the hits that fit in the rendered text."
+            )
         payload.update(
             {
                 "binding": {

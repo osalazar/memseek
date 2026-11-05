@@ -230,16 +230,16 @@ def artifact_parameter_schema(parameters: Mapping[str, Any]) -> dict[str, Any]:
 
 
 PAGING_HINT = (
-    " If a block has has_more, call again with offset set to that block's "
-    "next_offset. hard_offset, soft_offset, context_offset, people_offset, "
-    "style_offset, and extended_offset continue a single block."
+    " If a block has has_more, call again with that block's next_offset in "
+    "hard_offset, soft_offset, context_offset, people_offset, style_offset, "
+    "or extended_offset. A bare offset sets every one of those blocks."
 )
 
 
 def with_paging_hint(description: str) -> str:
     """Tell the agent how to turn next_offset into the next call."""
 
-    if "next_offset" in description:
+    if "hard_offset" in description and "next_offset" in description:
         return description
     return description.rstrip() + PAGING_HINT
 

@@ -39,9 +39,27 @@ def paginates(view) -> bool:
 
 def view_input_schema(view) -> dict[str, Any]:
     schema = parameters_json_schema(view.parameters)
-    if paginates(view):
+    if paginates(view) or getattr(view, "name", None) == "extended_context":
         schema["properties"].update(PAGE_PROPERTIES)
     return schema
+
+
+def fits_in_render(costs: list[int], *, budget: int, overhead: int) -> int:
+    """How many leading records fit in the render budget.
+
+    The page stops before a record that would overflow, so the rendered text
+    matches the hits. At least one record is kept when any exist, even if that
+    record alone is larger than the budget.
+    """
+
+    used = overhead
+    count = 0
+    for cost in costs:
+        if count and used + cost > budget:
+            break
+        count += 1
+        used += cost
+    return count
 
 
 def page_arguments(supplied):
@@ -117,30 +135,36 @@ async def execute_page(pool, *, workspace, view, parameters, spec, settings, cat
         raise SearchRequestError("page_changed", "Matching records or query changed; discard collected pages and restart at offset 0")
     if offset > total_count:
         raise SearchRequestError("view_page", "offset exceeds total_count")
-    has_more = offset + len(hits) < total_count
     rendered = None
-    rendered_truncated = False
-    if spec.render:
-        lines = []
-        used = fence_overhead_tokens(spec.fence, estimate_tokens)
+    # A full page of hits can still overflow the render budget. Keep only the
+    # records that fit, and point next_offset at the first one left out. The
+    # rendered text is then the whole page, so has_more is false only when
+    # nothing remains.
+    if spec.render and page_rows:
+        lines: list[str] = []
+        costs: list[int] = []
         for row in page_rows:
             line = render_record(RenderableRecord(id=row["id"], occurred_at=row["occurred_at"],
                 collection=str(row["collection"]), type=str(row["type"]), content=row["content"],
                 key=row["key"], scores=row["scores"]), profile="derivation_input", catalog=catalog)
-            cost = estimate_tokens(line)
-            if used + cost > settings.search_render_tokens:
-                rendered_truncated = True
-                break
             lines.append(line)
-            used += cost
-        rendered = render_rows(lines, fence=spec.fence)
+            costs.append(estimate_tokens(line))
+        keep = fits_in_render(
+            costs,
+            budget=settings.search_render_tokens,
+            overhead=fence_overhead_tokens(spec.fence, estimate_tokens),
+        )
+        hits = hits[:keep]
+        page_rows = page_rows[:keep]
+        rendered = render_rows(lines[:keep], fence=spec.fence)
+    has_more = offset + len(hits) < total_count
     return {
         "view": {"name": view.name, "version": view.version, "hash": view.definition_hash},
         "parameters": parameters,
         "hits": hits, "input_record_ids": [hit["id"] for hit in hits],
         "ranking": {"kind": "structured", "scored": False},
-        "rendered": rendered, "rendered_truncated": rendered_truncated,
-        "truncated": has_more or rendered_truncated,
+        "rendered": rendered, "rendered_truncated": False,
+        "truncated": has_more,
         "count": len(hits), "total_count": total_count, "limit": limit, "offset": offset,
         "has_more": has_more, "next_offset": offset + len(hits) if has_more else None,
         "snapshot": fingerprint,

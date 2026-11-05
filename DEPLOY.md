@@ -211,10 +211,13 @@ where workspace = 'personal'
 ```
 
 Context for the owner, private included by default. A block that was cut has
-`has_more: true` and a `next_offset`. Call `context` again with `offset` set
-to that value, or with that block's `hard_offset`, `context_offset`,
-`people_offset`, `soft_offset`, `style_offset`, or `extended_offset`.
-`truncated: true` with `has_more: false` is the last page, not a dead end.
+`has_more: true` and a `next_offset`. Call `context` again with that block's
+`hard_offset`, `context_offset`, `people_offset`, `soft_offset`,
+`style_offset`, or `extended_offset` set to `next_offset`. A bare `offset`
+sets every one of those blocks to the same value. The MCP `context` schema
+lists those fields. `extended_context` lists `limit`, `offset`, and
+`snapshot`; its page contains only the hits that fit in the rendered text,
+and `has_more` is false only when no hit is left out.
 
 ```bash
 # owner's own call: visibility omitted, private notes are included
